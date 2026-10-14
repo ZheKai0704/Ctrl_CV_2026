@@ -99,6 +99,50 @@ constexpr float SCURVE_SETTLE_TOL = 0.010f;    // 到位判定 (RPS)
 } // namespace MoveCfg
 
 // ============================================================================
+// 線上自適應 FF（RLS）— 方案 A 參數
+//   取代固定 pid.ff：FF = a*targetRps[i] + b。其中 (a, b) 由逐輪遞迴最小
+//   平方法（Recursive Least Squares, 遺忘因子 λ）持續線上更新，模型自動
+//   適應「目前電池電壓 + 目前地板摩擦」，無需電壓感測器。
+//
+//   模型形式（每輪）：duty ≈ θ·φ = a*rps + b（rps 為輪轉速）
+//      a = 增益倒數（duty%/RPS），b = 庫倫摩擦截距（duty%）。
+//   訓練樣本：(measRps, outDuty)——僅當「追蹤穩定 + 實際移動 + 未飽和」
+//   時採樣，讓 RLS 把殘差收斂成真正的「duty→轉速」逆增益 + 摩擦。
+//
+//   安全網保留：合成後仍經 ±PID_MAX_DUTY clamp、NaN 防護、風扇餘裕，
+//   模型輸出必須在既有物理界限內（詳見 onMoveCommand）。
+// ============================================================================
+namespace RlsCfg {
+// 遺忘因子 (0,1)：愈小追得愈快但對雜訊愈敏感；0.995 兼顧追漂移與穩健。
+constexpr float LAMBDA = 0.995f;
+// 初始協方差（大 → 開機前幾秒快速適應目前電壓/地板）。
+constexpr float P_INIT = 1000.0f;
+// 協方差上下限：防退化（失去適應力）與防爆炸（數值炸裂）。
+constexpr float P_MIN = 1e-3f;
+constexpr float P_MAX = 1e4f;
+// 僅量測轉速高於此值才採樣：避開零速/低於靜摩擦的雜訊樣本。
+constexpr float MIN_SPEED_RPS = 0.02f;
+// 追蹤視為穩定：|target - meas| < 此值才採樣，剔除暫態污染。
+constexpr float SETTLE_TOL_RPS = 0.05f;
+// 增益 / 截距物理界限（duty%，防模型越界）。
+constexpr float A_MIN = 0.0f;
+constexpr float A_MAX = 30.0f;
+constexpr float B_MIN = -15.0f;
+constexpr float B_MAX = 15.0f;
+} // namespace RlsCfg
+
+// 每輪 RLS 狀態（靜態分配；[FL, FR, BL, BR]）。
+struct RlsState {
+    float a = 15.0f; // 增益（初始 ≈ 原 pid.ff，開機後由 setup 以 kPidCfg 覆寫）
+    float b = 0.0f;  // 庫倫截距
+    // 2×2 協方差矩陣（僅需追蹤對稱元素）
+    float P00 = RlsCfg::P_INIT;
+    float P01 = 0.0f;
+    float P11 = RlsCfg::P_INIT;
+};
+static RlsState rls[4];
+
+// ============================================================================
 // 四輪閉迴路 PID 參數（由實測綁 PIO 架構依序調出；單位 duty% per
 // RPS）
 //   輪序 = [FL, FR, BL, BR]
@@ -303,6 +347,50 @@ static volatile uint32_t dbg_cmdCount = 0; // Core 1 實際執行 onCommand 的�
 static volatile float dbg_measRps = 0.0f;  // FL(輪0) 量測轉速
 static volatile float dbg_outDuty0 = 0.0f; // FL(輪0) 實際輸出 duty%
 
+// 對 clamped float 值做上下限（靜態函式，無動態分配）。
+static float clampf(float v, float lo, float hi) {
+    if(v < lo)
+        return lo;
+    if(v > hi)
+        return hi;
+    return v;
+}
+
+// RLS 更新：餵入一筆 (rps, duty)，應用到指定輪的 (a, b)。
+//   φ = [rps, 1]ᵀ，θ = [a, b]ᵀ
+//   僅在 onMoveCommand 中、訓練門檻通過時呼叫。
+static void rlsUpdate(RlsState &s, float rps, float duty) {
+    // 預測誤差
+    const float pred = s.a * rps + s.b;
+    const float err = duty - pred;
+
+    // K = P·φ / (λ + φᵀ·P·φ)
+    const float Pphi0 = s.P00 * rps + s.P01; // (P·φ)0 = P00*rps + P01
+    const float Pphi1 = s.P01 * rps + s.P11; // (P·φ)1 = P10*rps + P11 (=P01*rps+P11)
+    const float denom = RlsCfg::LAMBDA + rps * Pphi0 + Pphi1;
+    if(denom < 1e-6f) // 數值退化防護
+        return;
+    const float K0 = Pphi0 / denom;
+    const float K1 = Pphi1 / denom;
+
+    // θ += K·err
+    s.a += K0 * err;
+    s.b += K1 * err;
+
+    // P = (P - K·φᵀ·P) / λ；對稱化 + 上下限防炸
+    const float nP00 = (s.P00 - K0 * Pphi0) / RlsCfg::LAMBDA;
+    const float nP01 = (s.P01 - K0 * Pphi1) / RlsCfg::LAMBDA;
+    const float nP10 = (s.P01 - K1 * Pphi0) / RlsCfg::LAMBDA;
+    const float nP11 = (s.P11 - K1 * Pphi1) / RlsCfg::LAMBDA;
+    s.P00 = clampf(nP00, RlsCfg::P_MIN, RlsCfg::P_MAX);
+    s.P11 = clampf(nP11, RlsCfg::P_MIN, RlsCfg::P_MAX);
+    s.P01 = clampf((nP01 + nP10) * 0.5f, -RlsCfg::P_MAX, RlsCfg::P_MAX);
+
+    // 增益/截距物理界限
+    s.a = clampf(s.a, RlsCfg::A_MIN, RlsCfg::A_MAX);
+    s.b = clampf(s.b, RlsCfg::B_MIN, RlsCfg::B_MAX);
+}
+
 // ============================================================================
 // 硬體 PWM 輸出 + DIR（對齊 motor.h 行為）
 //   - duty>=0 → DIR=LOW(正轉)；duty<0 → DIR=HIGH(反轉)，輸出 |duty|
@@ -399,8 +487,10 @@ static void onMoveCommand(const ChassisSnapshot &cmd) {
             w.integral = 0.0f;
 
         // ---- PI 控制器（含抗風扇 + 低速精細化）----
+        // 前饋：方案 A 以 線上 RLS 自適應模型 (a*targetRps + b) 取代固定 pid.ff。
+        //   a = 逆增益（自動適應電池電壓），b = 庫倫摩擦截距（自動適應地板）。
         const WheelPidCfg &pid = kPidCfg[i];
-        const float ff = pid.ff * targetRps[i]; // 前饋出力 (duty%)
+        const float ff = rls[i].a * targetRps[i] + rls[i].b; // 自適應前饋 (duty%)
         const float p = pid.kP * err;
 
         // 積分上下限隨指令縮放：只讓積分補足「命令前饋出力以下」的誤差。
@@ -435,6 +525,22 @@ static void onMoveCommand(const ChassisSnapshot &cmd) {
 
         w.outDuty = out;
         wheelSetPwm(w.pwmPin, w.dirPin, out * kWheelPolarity[i]);
+
+        // ---- 線上 RLS 訓練（僅在條件成立時採樣）----
+        //   門檻：
+        //     1. 追蹤穩定   |err| < SETTLE_TOL_RPS
+        //     2. 實際移動   |measRps| > MIN_SPEED_RPS（避零速/靜摩擦雜訊）
+        //     3. 未飽和     |out| 未貼到 ±PID_MAX_DUTY（飽和樣本非逆增益）
+        //   避免在 ramp / 停車 / 飽和期間污染模型。
+        const bool settled =
+            (fabsf(err) < RlsCfg::SETTLE_TOL_RPS) &&
+            (fabsf(w.measRps) > RlsCfg::MIN_SPEED_RPS) &&
+            (fabsf(out) < MoveCfg::PID_MAX_DUTY - 1.0f);
+        if(settled) {
+            // 以「實際應用 duty」為目標、量測轉速為輸入 → 學得真正
+            //   逆增益「duty→轉速」映射（含 PI 已補足的殘餘摩擦）。
+            rlsUpdate(rls[i], w.measRps, out);
+        }
     }
     dbg_measRps = wheels[0].measRps;
     dbg_outDuty0 = wheels[0].outDuty;
@@ -535,10 +641,17 @@ void setup() {
         wheels[i].targetDuty = 0.0f;
         wheels[i].outDuty = 0.0f;
 
+        // 方案 A：RLS 初始增益以現有固定 ff 作為種子（無縫接軌，
+        //   開機即擁有與原本固定 FF 相同的行為，再由 RLS 逐步微調）。
+        rls[i].a = kPidCfg[i].ff;
+        rls[i].b = 0.0f;
+
         gpio_init(dirPins[i]);
         gpio_set_dir(dirPins[i], GPIO_OUT);
         gpio_put(dirPins[i], 1);
     }
+
+    Serial.println("[MOVE] FF = 線上 RLS 自適應（a*rps + b），初始 a=pid.ff，λ=0.995");
 }
 
 void loop() {
@@ -565,6 +678,12 @@ void loop() {
                           wheels[1].measRps, wheels[1].outDuty,
                           wheels[2].measRps, wheels[2].outDuty,
                           wheels[3].measRps, wheels[3].outDuty);
+            // 方案 A：RLS 自適應 FF 係數（觀察學習狀態）
+            //   a = 增益(duty%/RPS)，b = 庫倫摩擦截距(duty%)
+            Serial.printf("       RLS a=[%.2f %.2f %.2f %.2f] "
+                          "b=[%+.2f %+.2f %+.2f %+.2f]\n",
+                          rls[0].a, rls[1].a, rls[2].a, rls[3].a,
+                          rls[0].b, rls[1].b, rls[2].b, rls[3].b);
         }
     }
 }
