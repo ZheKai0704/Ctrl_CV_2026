@@ -30,23 +30,23 @@
 #include <pico/stdlib.h>
 
 // ============================================================================
-// 腳位定義（FR 已接：馬達 6/7 + 編碼器 14/15）
+// 腳位定義（2026 新板，move_pinmap / move_dir_test 實測驗證）
 // ============================================================================
 namespace Pin {
 // 硬體 UART0 — 與 Hub 通訊（SlaveComms 內部處理 TX=GP0, RX=GP1）
 
-// PWM + DIR for 4 wheels（依實測驗證結果：FR 6/7, FL 9/8,
-// BR 10/11, BL 12/13）
-constexpr uint MOTOR_FR_PWM = 6;
-constexpr uint MOTOR_FR_DIR = 7;
-constexpr uint MOTOR_FL_PWM = 9;
-constexpr uint MOTOR_FL_DIR = 8;
+// PWM + DIR for 4 wheels（新板實測：FL 7/6, FR 9/8, BL 13/12, BR 10/11）
+//   注意：新板的 DIR 與 PWM 腳位與舊板互換（舊板 FR 是 PWM=6/DIR=7）。
+constexpr uint MOTOR_FR_PWM = 9;
+constexpr uint MOTOR_FR_DIR = 8;
+constexpr uint MOTOR_FL_PWM = 7;
+constexpr uint MOTOR_FL_DIR = 6;
 constexpr uint MOTOR_BR_PWM = 10;
 constexpr uint MOTOR_BR_DIR = 11;
-constexpr uint MOTOR_BL_PWM = 12;
-constexpr uint MOTOR_BL_DIR = 13;
+constexpr uint MOTOR_BL_PWM = 13;
+constexpr uint MOTOR_BL_DIR = 12;
 
-// Encoder base pins（base & base+1，A=base）；依實測驗證結果：
+// Encoder base pins（base & base+1，A=base）；新板實測：
 // FR=14,15 FL=16,17 BR=20,21 BL=18,19
 constexpr uint MOTOR_FR_ENC = 14; // FR: A=14, B=15
 constexpr uint MOTOR_FL_ENC = 16; // FL: A=16, B=17
@@ -83,6 +83,19 @@ constexpr float VEL_LPF_TAU = 0.010f;
 // 停車指令判定閾值 (RPS)：目標輪轉速低於此值視為「停」，
 //   強制清空 PID 積分，避免殘留積分造成零指令下馬達緩慢蠕動。
 constexpr float StopCmdEpsRps = 0.005f;
+
+// ---- 開機 / 斷訊後的安全護欄 ----
+// 控制週期上下限 (s)：跨幀超過 DT_MAX_S 視為「剛開機、E-Stop 後、掉幀」
+//   → 該週期不採信編碼器差分，只重新同步狀態（避免幽靈轉速造成暴衝）。
+constexpr float DT_MIN_S = 1e-4f;
+constexpr float DT_MAX_S = 0.05f;
+// 物理合理輪轉速上限 (RPS)：單筆編碼器差分換算超過此值 → 判定為突波丟棄。
+//   實體上限約等於 PID 命令上限 MAX_RPS(7)，留一倍餘裕。
+constexpr float WHEEL_MAX_RPS = 15.0f;
+// 輸出斜率限制 (duty% / s)：安全網。不論回授突波、模型更新或數值異常，
+//   單一控制週期內的 duty 變化量都受限，不可能從 0 直接跳到滿載暴衝。
+//   1500 %/s → 10ms 週期最多 15%，0→100% 約 67ms。
+constexpr float OUTPUT_SLEW_DUTY_PER_S = 1500.0f;
 
 // ---- 車身 S 曲線速度剖面（SCurveRamp）參數 ----
 //   單位：車身速度為 RPS，加速度 RPS/s，Jerk RPS/s²。
@@ -157,20 +170,20 @@ static const WheelPidCfg kPidCfg[4] = {
     {2.40f, 10.4f, 0.0f, 15.2f}, // BR
 };
 
-// 每輪極性：依實測驗證（FR/BR 反轉），輪序 = [FL,
-// FR, BL, BR]。
-//   cmd.vx>0（往前）→ 四輪 targetRps 全正；FR/BR 經 -1 反相馬達（鏡像）→
-//   物理往前。
-static const int8_t kWheelPolarity[4] = {1, -1, 1, -1};
-// 編碼器讀取極性：FR/BR 因鏡像安裝在讀取端反轉 → 「馬達往前」四顆同號。
-//   與 kWheelPolarity 相同，形成自洽閉環（命令 + → 馬達往前 → 回授 +）。
-static const int8_t kEncReadPolarity[4] = {1, -1, 1, -1};
+// 每輪極性（新板 move_dir_test 實測），輪序 = [FL, FR, BL, BR]。
+//   麥克納姆前進時運動學得到 FL=+, FR=-, BL=-, BR=+（左右鏡像），本表再
+//   依實際馬達安裝方向修正，使 fwd 時四輪物理上都往車頭。
+static const int8_t kWheelPolarity[4] = {1, 1, -1, -1};
+// 編碼器讀取極性（move_dir_test `cal` 實測）：
+//   讓「韌體命令 + → 回授 +」四輪一致，形成自洽閉環。
+static const int8_t kEncReadPolarity[4] = {1, -1, -1, -1};
 
 // 車身兩條平移軸（vx = 左右 strafe、vy = 前後 forward）各自獨立方向開關。
 //   依實測車身方向微調，每條軸獨立 +1/-1，互不干擾 ω（旋轉）。
 //   ⚠ 四輪閉迴路為逐輪自洽伺服，且方向與 ω 皆經由同一組輪速組合產生，
 //     因此只能「一次翻一條軸」在車上實測確認，勿兩條同時猜。
-static const int8_t kAxisStrafePolarity = 1;
+//   新板實測：fwd/back 正常、left/right 相反 → strafe 軸改 -1（forward 維持 -1）。
+static const int8_t kAxisStrafePolarity = -1;
 static const int8_t kAxisForwardPolarity = -1;
 
 // ============================================================================
@@ -236,7 +249,8 @@ struct WheelState {
     uint dirPin;
     uint encPin;             // encoder base pin
     float targetDuty = 0.0f; // 目標 duty%（未直接使用，PID 直接算 out）
-    float outDuty = 0.0f;    // 實際輸出 duty%
+    float outDuty = 0.0f;    // PID 算出的 duty%（限幅前，供 RLS/遙測除錯）
+    float appliedDuty = 0.0f; // 經斜率限制後實際送到 PWM 的 duty%（含方向）
     int32_t encCount = 0;    // 編碼器計數（Host 端累計）
     float measRps = 0.0f;    // 低通後量測轉速（RPS）
     float integral = 0.0f;   // PI 積分項
@@ -342,7 +356,6 @@ static SlaveComms slave(&moveApp);
 static volatile float dbg_vx = 0.0f;
 static volatile float dbg_vy = 0.0f;
 static volatile float dbg_omega = 0.0f;
-static volatile bool dbg_estop = false;
 static volatile uint32_t dbg_cmdCount = 0; // Core 1 實際執行 onCommand 的次數
 static volatile float dbg_measRps = 0.0f;  // FL(輪0) 量測轉速
 static volatile float dbg_outDuty0 = 0.0f; // FL(輪0) 實際輸出 duty%
@@ -397,6 +410,11 @@ static void rlsUpdate(RlsState &s, float rps, float duty) {
 //   - 輸入為 duty%（-100~100）；極性已在呼叫端乘以 kWheelPolarity[]
 // ============================================================================
 static void wheelSetPwm(uint pwmPin, uint dirPin, float dutyPercent) {
+    // NaN 防護：NaN 經比較/轉型會產生未定義的 duty（可能直接滿載輸出）。
+    //   任何非有限值一律視為 0，寧可不出力也不可暴衝。
+    if(!std::isfinite(dutyPercent))
+        dutyPercent = 0.0f;
+
     bool fwd = (dutyPercent >= 0.0f);
     gpio_put(dirPin, fwd ? 0 : 1); // LOW=正轉, HIGH=反轉
     float a = fabsf(dutyPercent);
@@ -419,6 +437,57 @@ static void initWheelPwm(uint gpio) {
 }
 
 // ============================================================================
+// 馬達腳位表 — 靜態常數（不靠 setup() 執行時才填）
+//   關鍵：Core 1 在 Core 0 跑 setup() 的同時就已經在 slave.runCore1()
+//   spinloop（arduino-pico 先 launch core1 再呼叫 setup()），因此
+//   onMoveEstop() 可能在 wheels[] 尚未填 pin 欄位時就被呼叫；
+//   若 pin 欄位還是 0，就會亂寫 GP0／PWM slice 0。
+//   以下用 constexpr 表 + setup() 第一行就初始化，消除這個競態窗口。
+// ============================================================================
+static constexpr uint kPwmPins[4] = {Pin::MOTOR_FL_PWM, Pin::MOTOR_FR_PWM,
+                                     Pin::MOTOR_BL_PWM, Pin::MOTOR_BR_PWM};
+static constexpr uint kDirPins[4] = {Pin::MOTOR_FL_DIR, Pin::MOTOR_FR_DIR,
+                                     Pin::MOTOR_BL_DIR, Pin::MOTOR_BR_DIR};
+static constexpr uint kEncPins[4] = {Pin::MOTOR_FL_ENC, Pin::MOTOR_FR_ENC,
+                                     Pin::MOTOR_BL_ENC, Pin::MOTOR_BR_ENC};
+
+// ============================================================================
+// 馬達硬體安全初始化 — setup() 的「第一個」執行動作
+//   目的：把 PWM/DIR 從「未定義（輸入/浮動）」推進「確定零出力」，
+//   並把 wheels[] 的 pin 欄位在「任何可能寫 PWM 的程式碼之前」就備妥。
+//   必須早於 Serial.begin()/delay()，否則那段時間馬達腳位是未定義的。
+// ============================================================================
+static void initMotorHardware() {
+    for(int i = 0; i < 4; i++) {
+        // 1) DIR 先當普通 GPIO 輸出，先給定 LOW（正轉）而非懸空
+        gpio_init(kDirPins[i]);
+        gpio_set_dir(kDirPins[i], GPIO_OUT);
+        gpio_put(kDirPins[i], 0);
+
+        // 2) PWM 腳先當普通輸出拉低 → 就算 PWM 硬體還沒設好也確定是 0V
+        gpio_init(kPwmPins[i]);
+        gpio_set_dir(kPwmPins[i], GPIO_OUT);
+        gpio_put(kPwmPins[i], 0);
+
+        // 3) 控制器狀態清零（含跨核心共用的 pin 欄位）
+        wheels[i].pwmPin = kPwmPins[i];
+        wheels[i].dirPin = kDirPins[i];
+        wheels[i].encPin = kEncPins[i];
+        wheels[i].targetDuty = 0.0f;
+        wheels[i].outDuty = 0.0f;
+        wheels[i].appliedDuty = 0.0f;
+        wheels[i].integral = 0.0f;
+        wheels[i].measRps = 0.0f;
+        wheels[i].prevMeas = 0.0f;
+        wheels[i].hasPrev = false;
+
+        // 4) 接上 PWM 硬體（CC=0、duty=0）並再確認一次輸出為零
+        initWheelPwm(kPwmPins[i]);
+        wheelSetPwm(kPwmPins[i], kDirPins[i], 0.0f);
+    }
+}
+
+// ============================================================================
 // onMoveCommand — Core 1 收到命令時執行一次控制週期
 //   四輪皆速度閉迴路 PID：編碼器 RPS 回授 → ff + PI（抗飽和）→ duty%
 // ============================================================================
@@ -427,19 +496,22 @@ static void onMoveCommand(const ChassisSnapshot &cmd) {
     dbg_vx = cmd.vx;
     dbg_vy = cmd.vy;
     dbg_omega = cmd.omega;
-    dbg_estop = false;
 
     // 先消化 PIO 編碼器 FIFO（Core 1 控制週期內）
     drainEncoders();
 
     // 控制週期 dt（跨幀時間）
     uint64_t nowUs = time_us_64();
-    float dt = static_cast<float>(nowUs - lastTickUs) * 1e-6f;
-    if(dt < 1e-4f)
-        dt = 1e-4f;
-    if(dt > 0.05f)
-        dt = 0.05f;
+    const float rawDt = static_cast<float>(nowUs - lastTickUs) * 1e-6f;
     lastTickUs = nowUs;
+    // 首次命令（lastTickUs==0）或距上幀超過 DT_MAX_S（剛開機、E-Stop 後、掉幀）
+    //   → 本週期只重新同步狀態，不採信編碼器差分也不出力。
+    const bool resync = !(rawDt <= MoveCfg::DT_MAX_S);
+    float dt = rawDt;
+    if(!(dt > MoveCfg::DT_MIN_S))
+        dt = MoveCfg::DT_MIN_S;
+    if(dt > MoveCfg::DT_MAX_S)
+        dt = MoveCfg::DT_MAX_S;
 
     // ---- 車身 S 曲線速度剖面 ----
     //   平滑原始指令 → 平滑後指令，再餵給運動學/PID。
@@ -449,7 +521,8 @@ static void onMoveCommand(const ChassisSnapshot &cmd) {
     const float rOmega = rampOmega.updatePw(cmd.omega, dt);
 
     // 車身速度 (RPS) → 各輪目標線速度 (m/s)
-    //   rVx>0（往前）→ lin[0..3] 全正；FR/BR 再由輸出極性反相（鏡像）。
+    //   rVy>0（往前）→ 運動學得到 FL=+ FR=- BL=- BR=+（左右鏡像），
+    //   再由 kWheelPolarity[] 修正成四輪物理都往車頭（見上方極性說明）。
     float wx = kAxisStrafePolarity * rVx * TWO_PI;  // rad/s（左右軸方向開關）
     float wy = kAxisForwardPolarity * rVy * TWO_PI; // rad/s（前後軸方向開關）
     float K = MoveCfg::HALF_LENGTH + MoveCfg::HALF_WIDTH;
@@ -472,10 +545,28 @@ static void onMoveCommand(const ChassisSnapshot &cmd) {
         const int32_t c = enc[i]; // 已套 kEncReadPolarity（統一方向）
         const int32_t d = c - w.encCount;
         w.encCount = c;
-        // 低通量測轉速（含方向；enc 已統一符號 → 正目標對正量測）
-        float rawRps = static_cast<float>(d) /
-                       static_cast<float>(MoveCfg::ENC_COUNTS_PER_REV) / dt;
-        w.measRps += alpha * (rawRps - w.measRps);
+
+        // 開機 / 長時間斷幀後的第一幀：丟棄這段期間累積的編碼器差分。
+        //   期間車可能被手推、馬達浮動、PIO 剛起跑帶雜訊；若把這些計數
+        //   當成轉速，第一次命令就會被當成「正在高速轉」而猛出力 → 暴衝。
+        if(resync) {
+            w.measRps = 0.0f;
+            w.prevMeas = 0.0f;
+            w.integral = 0.0f;
+            w.hasPrev = false;
+            w.outDuty = 0.0f;
+            w.targetDuty = 0.0f;
+            w.appliedDuty = 0.0f;
+            wheelSetPwm(w.pwmPin, w.dirPin, 0.0f);
+            continue;
+        }
+
+        // 低通量測轉速（含方向；enc 已統一符號 → 正目標對正量測）。
+        //   單筆差分超過物理上限 → 視為編碼器突波，保留上次量測值。
+        const float rawRps = static_cast<float>(d) /
+                             static_cast<float>(MoveCfg::ENC_COUNTS_PER_REV) / dt;
+        if(fabsf(rawRps) <= MoveCfg::WHEEL_MAX_RPS)
+            w.measRps += alpha * (rawRps - w.measRps);
 
         const float err = targetRps[i] - w.measRps;
 
@@ -524,7 +615,21 @@ static void onMoveCommand(const ChassisSnapshot &cmd) {
             out = -MoveCfg::PID_MAX_DUTY;
 
         w.outDuty = out;
-        wheelSetPwm(w.pwmPin, w.dirPin, out * kWheelPolarity[i]);
+
+        // ---- 輸出斜率限制（安全網）----
+        //   不論上面的推論是否成立，duty 都不可能在單一週期從 0 跳到滿載。
+        //   任何回授突波 / 模型越界 / 數值異常最多造成 maxStep 的變化量。
+        const float maxStep = MoveCfg::OUTPUT_SLEW_DUTY_PER_S * dt;
+        float applied = out;
+        const float step = applied - w.appliedDuty;
+        if(step > maxStep)
+            applied = w.appliedDuty + maxStep;
+        else if(step < -maxStep)
+            applied = w.appliedDuty - maxStep;
+        if(!std::isfinite(applied))
+            applied = 0.0f;
+        w.appliedDuty = applied;
+        wheelSetPwm(w.pwmPin, w.dirPin, applied * kWheelPolarity[i]);
 
         // ---- 線上 RLS 訓練（僅在條件成立時採樣）----
         //   門檻：
@@ -535,11 +640,11 @@ static void onMoveCommand(const ChassisSnapshot &cmd) {
         const bool settled =
             (fabsf(err) < RlsCfg::SETTLE_TOL_RPS) &&
             (fabsf(w.measRps) > RlsCfg::MIN_SPEED_RPS) &&
-            (fabsf(out) < MoveCfg::PID_MAX_DUTY - 1.0f);
+            (fabsf(applied) < MoveCfg::PID_MAX_DUTY - 1.0f);
         if(settled) {
             // 以「實際應用 duty」為目標、量測轉速為輸入 → 學得真正
             //   逆增益「duty→轉速」映射（含 PI 已補足的殘餘摩擦）。
-            rlsUpdate(rls[i], w.measRps, out);
+            rlsUpdate(rls[i], w.measRps, applied);
         }
     }
     dbg_measRps = wheels[0].measRps;
@@ -550,7 +655,7 @@ static void onMoveCommand(const ChassisSnapshot &cmd) {
     for(int i = 0; i < 4; i++) {
         tm.currentRps[i] = wheels[i].measRps;
         tm.targetRps[i] = targetRps[i];
-        tm.pwmOutput[i] = wheels[i].outDuty;
+        tm.pwmOutput[i] = wheels[i].appliedDuty;
     }
     tm.cmdVx = rVx;
     tm.cmdVy = rVy;
@@ -565,49 +670,120 @@ static void onMoveCommand(const ChassisSnapshot &cmd) {
 // onMoveEstop — 立即歸零所有 PWM，並清 PID 積分
 // ============================================================================
 static void onMoveEstop() {
+    // S 曲線也一併歸零：若停留在舊速度，E-Stop 解除後的第一個命令
+    //   會直接以舊斜率／舊速度餵 PID → 瞬間大出力（暴衝）。
+    rampVx = SCurveRamp();
+    rampVy = SCurveRamp();
+    rampOmega = SCurveRamp();
+
     for(int i = 0; i < 4; i++) {
         wheels[i].targetDuty = 0.0f;
         wheels[i].outDuty = 0.0f;
+        wheels[i].appliedDuty = 0.0f;
         wheels[i].integral = 0.0f;
+        wheels[i].measRps = 0.0f;
+        wheels[i].prevMeas = 0.0f;
         wheels[i].hasPrev = false;
+        wheels[i].encCount = enc[i]; // 解除後不計入停止期間的差分
         wheelSetPwm(wheels[i].pwmPin, wheels[i].dirPin, 0.0f);
     }
-    dbg_estop = true;
 }
 
 // ============================================================================
 // 狀態 LED（板載 LED，例如 Waveshare RP2350 Plus 板上 LED）
-//   常亮  = E-Stop 生效
-//   閃爍  = 已連線（近期收到 Hub 有效命令）
-//   熄滅  = 未連線且非 E-Stop（<100ms 無有效命令）
+//
+// 只有三種狀態，全部由「通訊狀況」決定：
+//   ┌────────────────────┬──────────────┬──────────────────────┐
+//   │ 狀態               │ 圖樣         │ 亮 / 滅              │
+//   ├────────────────────┼──────────────┼──────────────────────┤
+//   │ 未連線 / 剛開機    │ 長亮         │ —                    │
+//   │ 已連線但 Idle      │ 0.5Hz 慢閃   │ 500ms / 1500ms       │
+//   │ 資料通訊中         │ 1Hz 短脈心跳 │ 80ms / 920ms         │
+//   └────────────────────┴──────────────┴──────────────────────┘
+//
+// 判定說明：
+//   * 「未連線」= 開機至今從未收到任何有效控制幀（validCmdCount == 0）。
+//     此時 SlaveComms 的 100ms 指令逾時保護也已生效（馬達歸零），
+//     監控會顯示 E-Stop（cmd timeout），LED 長亮代表「未連線 / 未受控」。
+//   * 「資料通訊中」= 最後有效控制幀距今 < ACTIVE_TIMEOUT_MS（Jetson 端
+//     韌體以 Hub 收到控制幀的頻率轉發，典型 10–20ms 一幀）
+//   * 「已連線但 Idle」= 曾連上 Hub，但目前超過 ACTIVE_TIMEOUT_MS 沒有
+//     控制幀。注意此刻馬達也已歸零——這是「沒收到資料」，不是斷線。
+//
+// 需要更精確的 E-Stop 資訊請看序列監控輸出的 led= / ESTOP 欄位。
 // ============================================================================
 namespace LedCfg {
-// 連線判定：最後有效命令距今超過此毫秒 → 視為斷線
-constexpr uint32_t CONNECTED_TIMEOUT_MS = 100;
-constexpr uint16_t BLINK_PERIOD_MS = 500; // 閃爍半週期（亮/滅各 250ms）
+// 視為「資料通訊中」的視窗（略大於典型控制週期，避免閃斷）
+constexpr uint32_t ACTIVE_TIMEOUT_MS = 150;
+
+// 已連線 + 資料通訊中：1Hz 短脈衝心跳（像路由器資料燈）
+constexpr uint32_t ACTIVE_ON_MS = 80;
+constexpr uint32_t ACTIVE_OFF_MS = 920;
+
+// 已連線但 Idle：0.5Hz 慢閃，鎮定不擾人
+constexpr uint32_t IDLE_ON_MS = 500;
+constexpr uint32_t IDLE_OFF_MS = 1500;
 } // namespace LedCfg
 
+enum class LedState : uint8_t { BOOT = 0, IDLE = 1, ACTIVE = 2 };
+
+static const char *ledStateName(LedState st) {
+    switch(st) {
+    case LedState::BOOT:
+        return "BOOT";
+    case LedState::IDLE:
+        return "IDLE";
+    default:
+        return "ACTIVE";
+    }
+}
+
+// 供 Core 0 除錯輸出用（與 LED 實際狀態保證一致）
+static volatile uint8_t dbg_ledState = static_cast<uint8_t>(LedState::BOOT);
+
+static LedState currentLedState() {
+    if(slave.validCmdCount() == 0)
+        return LedState::BOOT; // 開機至今從未收到有效幀
+    if(slave.msSinceLastValidCmd() < LedCfg::ACTIVE_TIMEOUT_MS)
+        return LedState::ACTIVE; // 資料通訊中
+    return LedState::IDLE; // 已連線，但目前沒有控制流
+}
+
 static void updateStatusLed() {
-    static uint32_t lastToggle = 0;
+    static LedState lastState = LedState::BOOT;
     static bool ledOn = false;
+    static uint32_t phaseStartMs = 0;
 
-    const bool estop = slave.isEstopActive();
-    const bool connected =
-        slave.msSinceLastValidCmd() < LedCfg::CONNECTED_TIMEOUT_MS;
-
-    if(estop) {
-        digitalWrite(LED_BUILTIN, HIGH); // E-Stop → 常亮
-        return;
-    }
-    if(!connected) {
-        digitalWrite(LED_BUILTIN, LOW); // 斷線且非 E-Stop → 熄滅
-        return;
-    }
-
-    // 已連線 → 閃爍
+    const LedState st = currentLedState();
     const uint32_t now = millis();
-    if(now - lastToggle >= LedCfg::BLINK_PERIOD_MS) {
-        lastToggle = now;
+
+    dbg_ledState = static_cast<uint8_t>(st);
+
+    // 狀態切換 → 重置相位並立刻點亮（先給一個脈衝，新狀態立即可見）
+    if(st != lastState) {
+        lastState = st;
+        phaseStartMs = now;
+        ledOn = true;
+        digitalWrite(LED_BUILTIN, HIGH);
+    }
+
+    // 未連線 / 剛開機 → 長亮（含 E-Stop 逾時狀態）
+    if(st == LedState::BOOT) {
+        digitalWrite(LED_BUILTIN, HIGH);
+        return;
+    }
+
+    uint32_t onMs = LedCfg::ACTIVE_ON_MS;
+    uint32_t offMs = LedCfg::ACTIVE_OFF_MS;
+    if(st == LedState::IDLE) {
+        onMs = LedCfg::IDLE_ON_MS;
+        offMs = LedCfg::IDLE_OFF_MS;
+    }
+
+    // 非阻塞相位推進：亮滿 onMs → 熄，熄滿 offMs → 亮
+    const uint32_t phaseMs = ledOn ? onMs : offMs;
+    if(now - phaseStartMs >= phaseMs) {
+        phaseStartMs = now;
         ledOn = !ledOn;
         digitalWrite(LED_BUILTIN, ledOn ? HIGH : LOW);
     }
@@ -617,39 +793,28 @@ static void updateStatusLed() {
 // Core 0
 // ============================================================================
 void setup() {
-    Serial.begin(115200);
-    delay(200);
-    Serial.println("[MOVE] FL 閉迴路 PID + 其他開迴路（等待 Hub 命令）");
+    // ⚠ 第一個執行動作：把馬達推向「確定零出力」
+    //   arduino-pico 先 launch core1 再呼叫 setup()，Core 1 此刻已經在
+    //   slave.runCore1() spinloop 裡；而 Serial.begin()/delay(200) 會拖
+    //   上百毫秒。這段期間馬達腳位若還在未定義狀態（或 wheels[] 的 pin
+    //   還是 0），就可能出現開機暴衝。因此先鎖定馬達腳位再開始其他的初始化。
+    initMotorHardware();
 
     pinMode(LED_BUILTIN, OUTPUT);
     digitalWrite(LED_BUILTIN, LOW);
 
-    slave.begin();
-
-    constexpr uint pwmPins[4] = {Pin::MOTOR_FL_PWM, Pin::MOTOR_FR_PWM,
-                                 Pin::MOTOR_BL_PWM, Pin::MOTOR_BR_PWM};
-    constexpr uint dirPins[4] = {Pin::MOTOR_FL_DIR, Pin::MOTOR_FR_DIR,
-                                 Pin::MOTOR_BL_DIR, Pin::MOTOR_BR_DIR};
-    constexpr uint encPins[4] = {Pin::MOTOR_FL_ENC, Pin::MOTOR_FR_ENC,
-                                 Pin::MOTOR_BL_ENC, Pin::MOTOR_BR_ENC};
-
+    // 方案 A：RLS 初始增益以現有固定 ff 作為種子（無縫接軌，
+    //   開機即擁有與原本固定 FF 相同的行為，再由 RLS 逐步微調）。
     for(int i = 0; i < 4; i++) {
-        initWheelPwm(pwmPins[i]);
-        wheels[i].pwmPin = pwmPins[i];
-        wheels[i].dirPin = dirPins[i];
-        wheels[i].encPin = encPins[i];
-        wheels[i].targetDuty = 0.0f;
-        wheels[i].outDuty = 0.0f;
-
-        // 方案 A：RLS 初始增益以現有固定 ff 作為種子（無縫接軌，
-        //   開機即擁有與原本固定 FF 相同的行為，再由 RLS 逐步微調）。
         rls[i].a = kPidCfg[i].ff;
         rls[i].b = 0.0f;
-
-        gpio_init(dirPins[i]);
-        gpio_set_dir(dirPins[i], GPIO_OUT);
-        gpio_put(dirPins[i], 1);
     }
+
+    Serial.begin(115200);
+    delay(200);
+    Serial.println("[MOVE] FL 閉迴路 PID + 其他開迴路（等待 Hub 命令）");
+
+    slave.begin();
 
     Serial.println("[MOVE] FF = 線上 RLS 自適應（a*rps + b），初始 a=pid.ff，λ=0.995");
 }
@@ -664,10 +829,15 @@ void loop() {
         lastPrint = nowCfg;
         uint32_t since = slave.msSinceLastValidCmd();
         uint32_t cnt = slave.validCmdCount();
-        Serial.printf("[MOVE] sinceCmd=%ums cnt=%u onCmd=%u\n", since, cnt,
-                      dbg_cmdCount);
-        if(dbg_estop) {
-            Serial.println("[MOVE] ** E-STOP active **");
+        Serial.printf("[MOVE] sinceCmd=%ums cnt=%u onCmd=%u led=%s\n", since, cnt,
+                      dbg_cmdCount,
+                      ledStateName(static_cast<LedState>(dbg_ledState)));
+        if(slave.isEstopActive()) {
+            // E-Stop 來源：逾時（沒收到資料）或 Hub 明確下令
+            const bool timeoutDriven =
+                since >= (RobotConfig::COMMAND_TIMEOUT_US / 1000ULL);
+            Serial.printf("[MOVE] ** E-STOP active (%s) **\n",
+                          timeoutDriven ? "cmd timeout, no data" : "hub estop");
         } else {
             Serial.printf("[MOVE] vx=%+.2f vy=%+.2f omega=%+.2f | "
                           "FL meas=%+.2fRPS out=%+.0f%%\n",

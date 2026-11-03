@@ -381,6 +381,35 @@ static ControlPacket rcToMovePacket() {
 }
 
 // ============================================================================
+// RC → Shoot ControlPacket（測試：CH2 同時驅動上/下射兩顆無刷）
+//
+// CH2 (rc_channels[1]) 原始值 -100~100 直接填入 shoot.upSpeed / downSpeed，
+// 由 Shoot 端測試程式自行映射為 0~100% 出力（-97→0, +97→100）。
+// pitch / row 固定 0 — 本階段不驅動步進馬達。
+// ============================================================================
+static constexpr bool RC_FORWARD_SHOOT = true; // false = 回到只轉發 Move
+
+static ControlPacket rcToShootPacket() {
+    ControlPacket pkt = {};
+    pkt.sync = 0xA5;
+    pkt.msgType = MsgType::CONTROL;
+    pkt.frameSeq = rcFallbackSeq++;
+    pkt.targetID = TargetID::SHOOT;
+    pkt.payloadLen = sizeof(ControlPacket) - 6 - 2;
+
+    const int8_t ch2 = rcToInt8(rc_channels[1]); // CH2 → -100~100
+    pkt.shoot.upSpeed = ch2;
+    pkt.shoot.downSpeed = ch2;
+    pkt.shoot.pitch = 0;
+    pkt.shoot.row = 0;
+
+    pkt.crc16 = 0;
+    pkt.crc16 = SignalUtils::calculateCrc(reinterpret_cast<uint8_t *>(&pkt),
+                                          sizeof(ControlPacket) - 2);
+    return pkt;
+}
+
+// ============================================================================
 // Core 0：Jetson 幀回呼
 //
 // jetsonComms 從 USB CDC 解出有效 ControlPacket 後觸發。
@@ -445,6 +474,21 @@ static void tryRcFallback() {
         sendOk++;
     else
         sendFail++;
+
+    // 遙控正常 → 轉發控制幀給 Shoot（PIO SM1, GP4 TX / GP5 RX）
+    // CH2 同時寫入 upSpeed / downSpeed → Shoot 端兩顆無刷同轉速
+    if(RC_FORWARD_SHOOT) {
+        ControlPacket sh = rcToShootPacket();
+        shootComms.sendPacket(sh);
+
+        static uint64_t lastShootDbgUs = 0;
+        uint64_t nowShoot = time_us_64();
+        if(nowShoot - lastShootDbgUs > 1000000ULL) {
+            lastShootDbgUs = nowShoot;
+            Serial.printf("[HUB] → Shoot up=%d down=%d (CH2=%d)\n",
+                          sh.shoot.upSpeed, sh.shoot.downSpeed, rc_channels[1]);
+        }
+    }
 
     // 除錯：直接對照「讀到的 rc_channels」與「送出的 mv.move.vx」
     // 確認 rcToMovePacket 是否真的把 rc_channels[1] 塞進 vx
