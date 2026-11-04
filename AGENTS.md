@@ -370,15 +370,18 @@ UART0 @ 420000 baud
 
 | 通道 | 變數 | 用途 | 目標 Slave |
 |------|------|------|-----------|
-| CH1 (Roll) | rc_channels[0] | vx（左右平移） | Move |
-| CH2 (Pitch) | rc_channels[1] | vy（前後移動） | Move |
-| CH8 | rc_channels[7] | omega（cw/ccw 旋轉） | Move |
-| CH3 | rc_channels[2] | upSpeed（上射速度） | Shoot |
-| CH5 | rc_channels[4] | downSpeed（下射速度） | Shoot |
-| CH7 | rc_channels[6] | pitch（俯仰） | Shoot |
-| CH8 | — | row（與 Move 的 omega 同通道，目前 `RC_FORWARD_SHOOT=false` 不轉發） | Shoot（未啟用） |
-| CH9 | rc_channels[8] | motorChannel（PCA9685 通道 0~15） | Storage |
-| CH10 | rc_channels[9] | trigger（0/1） | Storage |
+| ch0（CH1） | rc_channels[0] | vy（前後移動） | Move |
+| ch1（CH2） | rc_channels[1] | vx（左右平移） | Move |
+| ch2（CH3） | rc_channels[2] | pitch（上下仰角 -97~97） | Shoot |
+| ch3（CH4） | rc_channels[3] | row（左右水平 -97~97） | Shoot |
+| ch4（CH5） | rc_channels[4] | upSpeed/downSpeed：< 0 → 30%，≥ 0 → 0 | Shoot |
+| ch7（CH8） | rc_channels[7] | omega（cw/ccw 旋轉） | Move |
+| ch7（CH8） | rc_channels[7] | trigger：< 0 → 全部伺服跑一次循環 | Storage |
+| ch8 / ch9 | rc_channels[8/9] | 保留（Storage 本版未使用） | Storage |
+
+> ⚠ `ch7`（= `rc_channels[7]` = EdgeTX CH8）同時被 Move 的 omega 與 Storage 的
+> trigger 使用。只接單一節點測試時沒問題；兩者同時上線請改其中一個
+> （Hub 端 `RcMap::OMEGA` 或 `RcMap::STORAGE_TRIGGER`，改一行即可）。
 
 > Hub 端 `src/hub/main.cpp` 的 `RcMap` 集中管理通道與方向：
 > `VX=0 (CH1)`、`VY=1 (CH2)`、`OMEGA=7 (CH8)`；
@@ -434,10 +437,16 @@ UART0 @ 420000 baud
 
 ### 4. Storage Slave 節點腳位與參數
 - UART0: TX: GP0, RX: GP1 (與 Hub 通訊)
-- PCA9685: I2C1 (SDA:GP2, SCL:GP3), 預設位址 0x40
-- PCA9685 通道 0~9 連接 10 顆伺服馬達
-- Trigger 步進馬達: STEP(GP4), DIR(GP5), STEPPER_ENABLE(GP6)
-- 伺服脈衝: 500~2500μs (每通道可個別設定關閉/開啟位置)
+- PCA9685: I2C1 (SDA:GP2, SCL:GP3), 預設位址 0x40, 50Hz
+- PCA9685 通道 0~15 伺服馬達（實際啟用哪幾顆由 EEPROM 校正決定）
+- **只有伺服馬達**：trigger 步進馬達（GP4/5/6）已移除
+- 通道校正（min/max μs、實體角度範圍、反向、啟用）沿用 EEPROM，格式與
+  `pca9685_angle` / `test/mechanism` 相同（MAGIC `PCA4`），無設定時預設
+  16 通道全啟用、600~2400μs、0~180°、正向
+- 動作：`trigger` 上緣（Hub 端 ch7 < 0）→ 全部已啟用通道依序做
+  OUT(120°) → 停留 1s → HOME(30°) → 等 0.5s，跑完一輪就停；E-Stop 或
+  trigger 放開 → 全部回 HOME。
+- `StoragePayload.motorChannel` / `.sw` 目前保留未使用
 
 ### 5. Ultrasonic 節點
 - 獨立 Pico 節點（非 RP2350）

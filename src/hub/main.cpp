@@ -378,7 +378,10 @@ constexpr uint32_t IDLE_ON_MS = 500;
 constexpr uint32_t IDLE_OFF_MS = 1500;
 } // namespace LedCfg
 
-enum class LedState : uint8_t { BOOT = 0, ESTOP = 1, IDLE = 2, ACTIVE = 3 };
+enum class LedState : uint8_t { BOOT = 0,
+                                ESTOP = 1,
+                                IDLE = 2,
+                                ACTIVE = 3 };
 
 static const char *ledStateName(LedState st) {
     switch(st) {
@@ -469,11 +472,10 @@ static void forwardAllSlaves(const ControlPacket &pkt) {
 //     （文件舊版寫 CH4；可用 RcMap::OMEGA 改通道、RcMap::OMEGA_SIGN 改方向）
 //     方向實測：前後正常；左右與 cw/ccw 需反相（VX_SIGN/OMEGA_SIGN = -1）
 //
-//   Shoot:
-//     CH3 (Throttle) → rc_channels[2] → upSpeed   上射速度
-//     CH5            → rc_channels[4] → downSpeed 下射速度
-//     CH7            → rc_channels[6] → pitch     俯仰
-//     CH8            → rc_channels[7] → row       旋轉
+//   Shoot（0-based 索引；ch2 = 遙控器 CH3）：
+//     ch2 (rc_channels[2]) → pitch     上下仰角
+//     ch3 (rc_channels[3]) → row       左右水平
+//     ch4 (rc_channels[4]) → upSpeed / downSpeed：< 0 → 30%，≥ 0 → 0（停轉）
 //
 //   Storage:
 //     CH9            → rc_channels[8]  → motorChannel  PCA9685 通道 0~15
@@ -509,6 +511,10 @@ namespace RcMap {
 constexpr uint8_t VX = 0;
 constexpr uint8_t VY = 1;
 constexpr uint8_t OMEGA = 7;
+// Storage 機構觸發：< 0 就開始「全部通道跑一次」（Storage 端做上緣觸發）
+// ⚠ 目前與 OMEGA 同一個通道（ch7 = CH8）；只接 Storage 測試時沒差，
+//   若兩節點同時接，請把 STORAGE_TRIGGER 改成沒用到的通道（例如 6）。
+constexpr uint8_t STORAGE_TRIGGER = 7;
 // 方向修正（實機實測）：前後正常，左右與 cw/ccw 相反 → 這兩個反相。
 //   只影響「遙控備援」；Jetson/自駕送進來的 vx/omega 不受影響。
 constexpr int8_t VX_SIGN = -1;
@@ -525,8 +531,10 @@ constexpr float DEADBAND = 10.0f;           // 與 applyDeadband 相同
 // 車身 RPS → int8 線路刻度（Slave 端再乘 MAX_RPS/127）
 static int8_t rpsToWire(float rps) {
     float wire = rps * 127.0f / RobotConfig::MAX_RPS;
-    if(wire > 127.0f) wire = 127.0f;
-    if(wire < -127.0f) wire = -127.0f;
+    if(wire > 127.0f)
+        wire = 127.0f;
+    if(wire < -127.0f)
+        wire = -127.0f;
     return static_cast<int8_t>(lroundf(wire));
 }
 
@@ -538,8 +546,10 @@ static int8_t rcAxisToWire(int16_t ch, float fullRange, int8_t sign = 1) {
         return 0;
     const float span = 100.0f - RcMoveCfg::DEADBAND;
     float mag = (fabsf(v) - RcMoveCfg::DEADBAND) / span;
-    if(mag < 0.0f) mag = 0.0f;
-    if(mag > 1.0f) mag = 1.0f;
+    if(mag < 0.0f)
+        mag = 0.0f;
+    if(mag > 1.0f)
+        mag = 1.0f;
     return rpsToWire((v > 0.0f ? mag : -mag) * fullRange *
                      static_cast<float>(sign));
 }
@@ -576,15 +586,21 @@ static ControlPacket rcToMovePacket() {
 // ============================================================================
 // RC → Shoot ControlPacket
 //
-// 依 AGENTS 通道表：CH3→upSpeed、CH5→downSpeed、CH7→pitch、CH8→row。
+// 通道對照（0-based，ch2 = 遙控器 CH3）：
+//   ch2 → pitch  上下仰角
+//   ch3 → row    左右水平
+//   ch4 → upSpeed / downSpeed 開關：< 0 → 30（兩顆同時 30%），≥ 0 → 0（停轉）
+//
 //   ⚠ 舊版把 CH2（前後移動）同時灌進 up/down 兩顆無刷：推前進時發射馬達
 //     也跟著轉，瞬間大電流造成電壓下陷 → 四輪出力不一致 → 直走會偏。
-//     Shoot 端再把 -100~100 映射為 0~100%（-97→0, +97→100）。
+//     現在投射輪只由 ch4 開關控制，固定 30% 或 0%。
 // ============================================================================
-// 遙控備援時是否同時轉發 Shoot。測試直走時請保持 false —— 舊版把 CH2
-// （前後移動）灌進發射馬達，推/拉油門會讓兩顆無刷全速，瞬間大電流
-// 造成電壓下陷，四輪出力不一致 → 直走會偏。
-static constexpr bool RC_FORWARD_SHOOT = false;
+// 遙控備援時是否同時轉發 Shoot（步進兩軸）。現在 True：
+//   ch2 → 仰角、ch3 → 水平，ch4 → 投射輪 30%/停。
+static constexpr bool RC_FORWARD_SHOOT = true;
+
+// ch4 打到負邊 → 投射輪固定出力；否則停轉（直接用原始值，不套死區）
+constexpr int8_t SHOOT_SPEED_ON_CH4 = 30; // %
 
 static ControlPacket rcToShootPacket() {
     ControlPacket pkt = {};
@@ -594,14 +610,42 @@ static ControlPacket rcToShootPacket() {
     pkt.targetID = TargetID::SHOOT;
     pkt.payloadLen = sizeof(ControlPacket) - 6 - 2;
 
-    // 無刷只有單向（1500us=停、2000us=全速），負值在 Shoot 端會被取絕對值
-    // 變成全速，因此這裡把負值夾成 0，避免開關在 -97 時馬達狂轉。
-    const int8_t up = rcToInt8(rc_channels[2]);   // CH3
-    const int8_t down = rcToInt8(rc_channels[4]); // CH5
-    pkt.shoot.upSpeed = up > 0 ? up : 0;
-    pkt.shoot.downSpeed = down > 0 ? down : 0;
-    pkt.shoot.pitch = rcToInt8(rc_channels[6]);   // CH7
-    pkt.shoot.row = rcToInt8(rc_channels[7]);     // CH8
+    // ch4 < 0 → 上下射皆 30%；ch4 ≥ 0 → 0（Shoot 端對應 1500µs 中立、停轉）
+    const int8_t shootSpeed =
+        (rc_channels[4] < 0) ? SHOOT_SPEED_ON_CH4 : static_cast<int8_t>(0);
+    pkt.shoot.upSpeed = shootSpeed;
+    pkt.shoot.downSpeed = shootSpeed;
+    pkt.shoot.pitch = rcToInt8(rc_channels[2]); // ch2 上下仰角
+    pkt.shoot.row = rcToInt8(rc_channels[3]);   // ch3 左右水平
+
+    pkt.crc16 = 0;
+    pkt.crc16 = SignalUtils::calculateCrc(reinterpret_cast<uint8_t *>(&pkt),
+                                          sizeof(ControlPacket) - 2);
+    return pkt;
+}
+
+// ============================================================================
+// RC → Storage ControlPacket
+//
+//   ch7 (rc_channels[7]) < 0 → trigger=1，Storage 在「上緣」觸發
+//                              全部已啟用伺服通道跑一次循環
+//   ch7 ≥ 0                  → trigger=0（Storage 停止並全部回 HOME）
+//
+// motorChannel / sw 本版 Storage 不使用，固定填 0。
+// ============================================================================
+static constexpr bool RC_FORWARD_STORAGE = true;
+
+static ControlPacket rcToStoragePacket() {
+    ControlPacket pkt = {};
+    pkt.sync = 0xA5;
+    pkt.msgType = MsgType::CONTROL;
+    pkt.frameSeq = rcFallbackSeq++;
+    pkt.targetID = TargetID::STORAGE;
+    pkt.payloadLen = sizeof(ControlPacket) - 6 - 2;
+
+    pkt.storage.motorChannel = 0; // 本版不使用
+    pkt.storage.sw = 0;           // 本版不使用
+    pkt.storage.trigger = (rc_channels[RcMap::STORAGE_TRIGGER] < 0) ? 1 : 0;
 
     pkt.crc16 = 0;
     pkt.crc16 = SignalUtils::calculateCrc(reinterpret_cast<uint8_t *>(&pkt),
@@ -678,7 +722,7 @@ static void tryRcFallback() {
         sendFail++;
 
     // 遙控正常 → 轉發控制幀給 Shoot（PIO SM1, GP4 TX / GP5 RX）
-    // CH2 同時寫入 upSpeed / downSpeed → Shoot 端兩顆無刷同轉速
+    // ch2 → 上下仰角、ch3 → 左右水平；ch4 < 0 → 投射輪 30%，否則停轉
     if(RC_FORWARD_SHOOT) {
         ControlPacket sh = rcToShootPacket();
         shootComms.sendPacket(sh);
@@ -687,9 +731,30 @@ static void tryRcFallback() {
         uint64_t nowShoot = time_us_64();
         if(nowShoot - lastShootDbgUs > 1000000ULL) {
             lastShootDbgUs = nowShoot;
-            Serial.printf("[HUB] → Shoot up=%d down=%d (CH3=%d CH5=%d)\n",
-                          sh.shoot.upSpeed, sh.shoot.downSpeed,
-                          rc_channels[2], rc_channels[4]);
+            Serial.printf("[HUB] → Shoot pitch=%d row=%d (ch2=%d ch3=%d) "
+                          "up=%d down=%d (ch4=%d)\n",
+                          sh.shoot.pitch, sh.shoot.row, rc_channels[2],
+                          rc_channels[3], sh.shoot.upSpeed,
+                          sh.shoot.downSpeed, rc_channels[4]);
+        }
+    }
+
+    // 遙控正常 → 轉發控制幀給 Storage（PIO SM2, GP6 TX / GP7 RX）
+    // ch7 < 0 → trigger=1，Storage 端以上緣觸發「全部通道跑一次」
+    if(RC_FORWARD_STORAGE) {
+        ControlPacket st = rcToStoragePacket();
+        storageComms.sendPacket(st);
+
+        static uint64_t lastStorageDbgUs = 0;
+        static uint8_t lastTrigger = 0;
+        uint64_t nowStorage = time_us_64();
+        if(nowStorage - lastStorageDbgUs > 1000000ULL ||
+           st.storage.trigger != lastTrigger) {
+            lastStorageDbgUs = nowStorage;
+            lastTrigger = st.storage.trigger;
+            Serial.printf("[HUB] → Storage trigger=%u (ch%d=%d)\n",
+                          static_cast<unsigned>(st.storage.trigger),
+                          RcMap::STORAGE_TRIGGER, rc_channels[RcMap::STORAGE_TRIGGER]);
         }
     }
 

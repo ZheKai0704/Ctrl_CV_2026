@@ -125,6 +125,14 @@ static float reportedDeg = 0.0f;
 static uint32_t lastPollUs = 0;
 static bool enabled = false;
 
+// —— 診斷（Core 1 寫、Core 0 讀）——
+static volatile uint32_t rxByteCount = 0; // 從驅動器收到的總位元組
+static volatile uint32_t replyCount = 0;  // 成功解析的 0x36 回覆次數
+static volatile int32_t lastReplyRaw = 0; // 最近一次回覆的原始值
+static volatile uint8_t lastReplySign = 0;
+static volatile uint8_t lastReplyHex[8] = {0}; // 最近一次完整回覆（8 bytes）
+static volatile bool lastReplyHexValid = false;
+
 static void send(const uint8_t *buf, uint8_t len) { elevSerial.write(buf, len); }
 
 static void sendEnable(bool en) {
@@ -228,11 +236,13 @@ void poll() {
     while(elevSerial.available() > 0) {
         if(rxLen < sizeof(rxBuf)) {
             rxBuf[rxLen++] = static_cast<uint8_t>(elevSerial.read());
+            rxByteCount++;
         } else {
             // 溢位：丟掉最舊的一半，重新同步
             memmove(rxBuf, rxBuf + sizeof(rxBuf) / 2, sizeof(rxBuf) / 2);
             rxLen = sizeof(rxBuf) / 2;
             elevSerial.read();
+            rxByteCount++;
         }
     }
 
@@ -246,6 +256,14 @@ void poll() {
                            static_cast<uint32_t>(rxBuf[i + 6]);
             float deg = static_cast<float>(raw) * 360.0f / 65536.0f;
             reportedDeg = (rxBuf[i + 2] != 0) ? -deg : deg;
+            // 診斷快照
+            replyCount++;
+            lastReplyRaw = static_cast<int32_t>(raw);
+            lastReplySign = rxBuf[i + 2];
+            for(uint8_t k = 0; k < 8; k++) {
+                lastReplyHex[k] = rxBuf[i + k];
+            }
+            lastReplyHexValid = true;
             // 吃掉這 8 bytes
             memmove(rxBuf + i, rxBuf + i + 8, rxLen - (i + 8));
             rxLen = static_cast<uint8_t>(rxLen - 8);
@@ -287,6 +305,29 @@ bool isStopped() { return stopSent; }
 int32_t commandedPulses() { return lastSentPulses; }
 
 float reportedAngleDeg() { return reportedDeg; }
+
+// —— 診斷用 accessor ——
+uint32_t rxBytes() { return rxByteCount; }
+uint32_t replies() { return replyCount; }
+int32_t lastRaw() { return lastReplyRaw; }
+uint8_t lastSign() { return lastReplySign; }
+bool hasValidReplyFrame() { return lastReplyHexValid; }
+/// 把最近一次 0x36 回覆的 8 bytes 印成 hex（無回覆時不印）
+void printLastReplyHex() {
+    if(!lastReplyHexValid) {
+        return;
+    }
+    for(uint8_t i = 0; i < 8; i++) {
+        Serial.printf("%02X ", static_cast<unsigned>(lastReplyHex[i]));
+    }
+}
+
+/// 命令脈衝 → 角度（°），供「命令 vs 實測」對照
+float commandedAngleDeg() {
+    return static_cast<float>(lastSentPulses) * 360.0f / PULSES_PER_REV;
+}
+
+uint8_t deviceAddr() { return Emm::ADDR; }
 } // namespace ElevStepper
 
 // ============================================================================
@@ -684,6 +725,24 @@ static MoveTelemetry pendingTm = {}; // Core 1 寫入 → Core 0 發送
 static volatile uint32_t dbg_cmdCount = 0;
 static volatile uint32_t dbg_estopCount = 0;
 
+// 最近一次收到的命令（Core 1 寫、Core 0 讀；供序列監控比對解析結果）
+static volatile int8_t dbg_lastPitch = 0;
+static volatile int8_t dbg_lastRow = 0;
+static volatile int8_t dbg_lastUp = 0;
+static volatile int8_t dbg_lastDown = 0;
+
+// 把 float 以「整數 + 一位小數」印出來
+// （newlib-nano 的 printf 沒開浮點（_printf_float），%f/%.1f 會直接印不出東西）
+static void printFixed1(float value) {
+    int32_t v10 = static_cast<int32_t>(lroundf(value * 10.0f));
+    const char *sign = (v10 < 0) ? "-" : "";
+    if(v10 < 0) {
+        v10 = -v10;
+    }
+    Serial.printf("%s%ld.%ld", sign, static_cast<long>(v10 / 10),
+                  static_cast<long>(v10 % 10));
+}
+
 // E-Stop 期間仍要告訴 Hub「我被停了」（遙測只在收到命令時才組，所以另外補送）
 constexpr uint32_t ESTOP_TM_INTERVAL_MS = 200;
 
@@ -716,6 +775,10 @@ static void buildTelemetry(uint8_t estopFlag) {
 
 static void onShootCommand(const ChassisSnapshot &cmd) {
     dbg_cmdCount++;
+    dbg_lastPitch = static_cast<int8_t>(lroundf(cmd.pitch));
+    dbg_lastRow = static_cast<int8_t>(lroundf(cmd.row));
+    dbg_lastUp = static_cast<int8_t>(lroundf(cmd.shootUpSpeed));
+    dbg_lastDown = static_cast<int8_t>(lroundf(cmd.shootDownSpeed));
 
     // 永久性速度：每次命令都储存並套用（包括速度=0 的清零指令）
     SpeedStorage::saveUpSpeed(cmd.shootUpSpeed);
@@ -934,14 +997,47 @@ void loop() {
                           static_cast<unsigned>(dbg_estopCount),
                           ElevStepper::isStopped() ? 1 : 0);
         } else {
-            Serial.printf("[SHOOT] sinceCmd=%ums cnt=%u led=%s | 仰角 %.1f° 水平 %ld 步 | "
-                          "up=%.0f down=%.0f\n",
+            const int8_t upSpeed = static_cast<int8_t>(lroundf(SpeedStorage::getUpSpeed()));
+            const int8_t downSpeed =
+                static_cast<int8_t>(lroundf(SpeedStorage::getDownSpeed()));
+            Serial.printf("[SHOOT] sinceCmd=%ums cnt=%u led=%s | cmd pitch=%d row=%d | ",
                           since, static_cast<unsigned>(dbg_cmdCount),
                           ledStateName(static_cast<LedState>(dbg_ledState)),
-                          static_cast<double>(ElevStepper::reportedAngleDeg()),
+                          static_cast<int>(dbg_lastPitch),
+                          static_cast<int>(dbg_lastRow));
+            Serial.print("仰角 ");
+            printFixed1(ElevStepper::reportedAngleDeg());
+            Serial.print("° (cmd ");
+            printFixed1(ElevStepper::commandedAngleDeg());
+            Serial.printf("°) 水平 %ld 步 | up=%d down=%d | rx=%u crc=%u | elev rep=%u frx=%u\n",
                           static_cast<long>(RowStepper::positionSteps()),
-                          static_cast<double>(SpeedStorage::getUpSpeed()),
-                          static_cast<double>(SpeedStorage::getDownSpeed()));
+                          static_cast<int>(upSpeed), static_cast<int>(downSpeed),
+                          static_cast<unsigned>(slave.rxFrameCount()),
+                          static_cast<unsigned>(slave.rxCrcErrorCount()),
+                          static_cast<unsigned>(ElevStepper::replies()),
+                          static_cast<unsigned>(ElevStepper::rxBytes()));
+        }
+    }
+
+    // 仰角驅動器（0x36 回覆）診斷 — 每秒一次
+    {
+        static uint32_t lastElevDbgMs = 0;
+        if(nowMs - lastElevDbgMs >= 1000) {
+            lastElevDbgMs = nowMs;
+            if(ElevStepper::replies() > 0) {
+                Serial.print("[SHOOT] elev reply: ");
+                ElevStepper::printLastReplyHex();
+                Serial.printf("| raw=%ld sign=%u\n",
+                              static_cast<long>(ElevStepper::lastRaw()),
+                              static_cast<unsigned>(ElevStepper::lastSign()));
+            } else if(slave.validCmdCount() > 0 && nowMs > 5000) {
+                Serial.printf(
+                    "[SHOOT] !! 仰角驅動器 0x36 完全無回覆（frx=%u）→ 檢查："
+                    "馬達 TX→GP3、GP2→馬達 R/A、共地、P_Serial=UART、"
+                    "位址=%u、baud=115200\n",
+                    static_cast<unsigned>(ElevStepper::rxBytes()),
+                    static_cast<unsigned>(ElevStepper::deviceAddr()));
+            }
         }
     }
 }

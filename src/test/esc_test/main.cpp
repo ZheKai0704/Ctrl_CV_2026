@@ -2,7 +2,7 @@
 // esc_test — 單向無刷馬達 (Hobbywing 航模油門電調) 測試控制 (RP2350)
 //
 // 用途：
-//   以 RP2350 硬體 PWM 驅動 2 顆「航模單向油門」電調，2450KV 馬達。
+//   以 RP2350 硬體 PWM 驅動 3 顆「航模單向油門」電調，2450KV 馬達。
 //   透過 USB Serial 設定每顆馬達的「出力 %」(僅順向油門)。適合直連燒機/
 //   單獨驗證推力——無伺服控時。
 //
@@ -18,20 +18,22 @@
 //   clkdiv = 150 → PWM 切片時脈恰為 1MHz,每 tick = 1µs,wrap=19999 → 50Hz。
 //   之前誤用 125(那是 RP2040/Pico1 值),等同切片 1.2MHz、脈寬全被拉長 20%。
 //
-// 接線（RP2350）：GP18→ESC1(馬達A)  GP19→ESC2(馬達B)；共地；三相線接好。
+// 接線（RP2350）：GP18→ESC1(馬達A)  GP19→ESC2(馬達B)  GP20→ESC3(馬達C)
+//                 共地；三相線接好。
 // RP2350 PWM:clkdiv=150, wrap=19999 → 1MHz 計數、50Hz(150MHz/150=1MHz)。
 
 // Serial 命令（115200, 字首大小寫不拘；輸入後按 Enter 才會執行）：
 //   A <0-100>   馬達 A 出力 %        B <0-100>   馬達 B 出力 %
-//   ALL <0-100> 兩顆同時出力
+//   C <0-100>   馬達 C 出力 %
+//   ALL <0-100> 三顆同時出力
 //   CAL         油門端點校準(會先拉到全油門→再回 0 存端點;請遠離槳)。
 //               ※ 校準前務必先關電,讓電調重新以…見說明印
-//   0           兩顆緩降回 0%（熄火/低點）
-//   X           兩顆立即斷油（真急停，唯一不經 slew 的命令）
+//   0           三顆緩降回 0%（熄火/低點）
+//   X           三顆立即斷油（真急停，唯一不經 slew 的命令）
 //   ACC <%/s>   設定加速率（緩加速）    DEC <%/s>  設定減速率（緩減速）
-//   + / -       兩顆微調（帶量）       R 讀狀態    ?/h 幫助
+//   + / -       三顆微調（帶量）       R 讀狀態    ?/h 幫助
 //
-// 加減速：所有出力變化（含 A/B/ALL/0/微調）一律以 ACC/DEC 速率斜坡趨近，
+// 加減速：所有出力變化（含 A/B/C/ALL/0/微調）一律以 ACC/DEC 速率斜坡趨近，
 //         不會瞬間跳到目標值，也不會瞬間停止。預設 ACC=40 %/s、DEC=60 %/s。
 // ============================================================================
 #include <Arduino.h>
@@ -44,7 +46,13 @@
 namespace Pin {
 constexpr uint MOTOR_A_PWM = 18; // GP18 → ESC1 信號 (馬達 A)
 constexpr uint MOTOR_B_PWM = 19; // GP19 → ESC2 信號 (馬達 B)
+constexpr uint MOTOR_C_PWM = 20; // GP20 → ESC3 信號 (馬達 C)
 } // namespace Pin
+
+// 三顆馬達的索引與對應 PWM 腳位
+constexpr uint8_t MOTOR_COUNT = 3;
+constexpr uint MOTOR_PWM[MOTOR_COUNT] = {Pin::MOTOR_A_PWM, Pin::MOTOR_B_PWM,
+                                         Pin::MOTOR_C_PWM};
 
 // ============================================================================
 // 油門 / PWM 參數  (Pico2/RP2350 = 150MHz)
@@ -69,10 +77,8 @@ constexpr uint32_t RAMP_TICK_US       = 2000;   // slew 更新週期 2ms
 
 // 目前目標（未 slew 完成的即時值）+ 實際輸出
 // s_outX 單位 = 0.001%（0..100000）
-static int32_t s_outA = 0;
-static int32_t s_outB = 0;
-static int16_t s_cmdA = 0; // 目標 %
-static int16_t s_cmdB = 0;
+static int32_t s_out[MOTOR_COUNT] = {0, 0, 0};
+static int16_t s_cmd[MOTOR_COUNT] = {0, 0, 0}; // 目標 %
 
 // 加減速率（單位 0.001%/s）
 static int32_t s_rampUp   = Esc::RAMP_UP_PCT_S_DEF * Esc::OUT_SCALE;
@@ -103,24 +109,25 @@ static void setupPwm(uint gpio) {
 }
 
 // 直接寫入某個出力（跳過 slew）——僅急停 X / 校準 CAL 使用
-static void hardSet(uint gpio, int32_t &out, int16_t pct) {
+static void hardSet(uint8_t idx, int16_t pct) {
     if(pct < 0) pct = 0;
     if(pct > Esc::MAX_PCT) pct = Esc::MAX_PCT;
-    out = static_cast<int32_t>(pct) * Esc::OUT_SCALE;
-    setPulse(gpio, outToPulse(out));
+    s_out[idx] = static_cast<int32_t>(pct) * Esc::OUT_SCALE;
+    setPulse(MOTOR_PWM[idx], outToPulse(s_out[idx]));
 }
 
-static void hardIdle(uint gpio, int32_t &out) { hardSet(gpio, out, 0); }
+static void hardIdle(uint8_t idx) { hardSet(idx, 0); }
 
 // 緩加速/緩減速：朝 target 以 dtUs 內允許的量逐步靠近（0.001% 單位）
-static void slewToward(uint gpio, int32_t &out, int16_t targetPct, uint32_t dtUs) {
+static void slewToward(uint8_t idx, int16_t targetPct, uint32_t dtUs) {
     int32_t target = static_cast<int32_t>(targetPct) * Esc::OUT_SCALE;
     if(target < 0) target = 0;
     if(target > Esc::OUT_MAX) target = Esc::OUT_MAX;
 
+    int32_t &out = s_out[idx];
     int32_t diff = target - out;
     if(diff == 0) {
-        setPulse(gpio, outToPulse(out));
+        setPulse(MOTOR_PWM[idx], outToPulse(out));
         return;
     }
 
@@ -136,7 +143,7 @@ static void slewToward(uint gpio, int32_t &out, int16_t targetPct, uint32_t dtUs
     }
     if(out < 0) out = 0;
     if(out > Esc::OUT_MAX) out = Esc::OUT_MAX;
-    setPulse(gpio, outToPulse(out));
+    setPulse(MOTOR_PWM[idx], outToPulse(out));
 }
 
 // 速率設定（%/s → 0.001%/s）
@@ -144,6 +151,14 @@ static void setRampRate(int32_t &rate, int16_t pctPerSec) {
     if(pctPerSec < Esc::RAMP_MIN_PCT_S) pctPerSec = Esc::RAMP_MIN_PCT_S;
     if(pctPerSec > Esc::RAMP_MAX_PCT_S) pctPerSec = Esc::RAMP_MAX_PCT_S;
     rate = static_cast<int32_t>(pctPerSec) * Esc::OUT_SCALE;
+}
+
+// 找最大目前出力（供 0 命令估算緩降時間）
+static int32_t maxOut() {
+    int32_t m = 0;
+    for(uint8_t i = 0; i < MOTOR_COUNT; i++)
+        if(s_out[i] > m) m = s_out[i];
+    return m;
 }
 
 // ============================================================================
@@ -203,17 +218,18 @@ static void printHelp() {
     Serial.println("=== 單向無刷馬達 (Skywalker 油門) 測試 — RP2350@150MHz ===");
     Serial.println("   0% = 1000µs 熄火    100% = 2000µs 全速   50Hz");
     Serial.println("   時脈: clkdiv=150 → 每 tick 1µs (Pico2 150MHz)");
-    Serial.println("   GP18→馬達A ESC1      GP19→馬達B ESC2");
+    Serial.println("   GP18→馬達A ESC1   GP19→馬達B ESC2   GP20→馬達C ESC3");
     Serial.println();
     Serial.println("命令 (單位 %，0-100，字首大小寫不拘，打完按 Enter)：");
     Serial.println("  A <0-100>   馬達 A 出力");
     Serial.println("  B <0-100>   馬達 B 出力");
-    Serial.println("  ALL <0-100> 兩顆同時出力");
+    Serial.println("  C <0-100>   馬達 C 出力");
+    Serial.println("  ALL <0-100> 三顆同時出力");
     Serial.println("  CAL         油門端點校準(先拆槳,依畫面指示斷電重上)");
-    Serial.println("  0           兩顆『緩降』回 0%（熄火）");
-    Serial.println("  X           兩顆『立即』斷油（真急停，唯一不經斜坡）");
+    Serial.println("  0           三顆『緩降』回 0%（熄火）");
+    Serial.println("  X           三顆『立即』斷油（真急停，唯一不經斜坡）");
     Serial.println("  ACC <1-400> 加速率 %/s（緩加速）   DEC <1-400> 減速率 %/s");
-    Serial.println("  + / - ε     兩顆微調 (帶量如 +5 / -10)");
+    Serial.println("  + / - ε     三顆微調 (帶量如 +5 / -10)");
     Serial.println("  R           讀目前出力 % / µs / 加減速率");
     Serial.println("  ? 或 h      此幫助");
     Serial.println();
@@ -225,7 +241,7 @@ static void printHelp() {
     Serial.println();
 }
 
-// 油門端點校準（標準航模電調:全程油門 2s→回 0%)
+// 油門端點校準（標準航模電調:全程油門 2s→回 0%）
 //   電調會把 100% 脈寬與 0% 脈寬記起來,消除各廠中立偏移。
 //   安全:執行前必須已拆槳/無負載,並在提示下自行『斷電再上電』
 //   使電調以『它在收全油門瞬間電力啟動』進入校準模式(多數 Skywalker)。
@@ -233,10 +249,10 @@ static void printHelp() {
 // -------------------------------------------------------------------
 static bool runThrottleCal() {
     // 收回命令立即回 0,避免殘餘（校準流程本身即需要直接跳變）
-    hardIdle(Pin::MOTOR_A_PWM, s_outA);
-    hardIdle(Pin::MOTOR_B_PWM, s_outB);
-    s_cmdA = s_cmdB = 0;
-    s_outA = s_outB = 0;
+    for(uint8_t i = 0; i < MOTOR_COUNT; i++) {
+        hardIdle(i);
+        s_cmd[i] = 0;
+    }
 
     // flush 殘留
     while(Serial.available()) Serial.read();
@@ -247,11 +263,10 @@ static bool runThrottleCal() {
     Serial.println("        校準→記住高/低端點。以下我會先把訊號拉全,");
     Serial.println("        你在這期間把電調【斷電再上電】。");
     Serial.println();
-    Serial.println("  現把出力拉到 100% (2000µs)…");
+    Serial.println("  現把三顆出力拉到 100% (2000µs)…");
     // 1) 先送全油門 —— 讓電調『以此開機』進入校準
-    setPulse(Pin::MOTOR_A_PWM, Esc::PULSE_MAX);
-    setPulse(Pin::MOTOR_B_PWM, Esc::PULSE_MAX);
-    s_outA = s_outB = Esc::OUT_MAX;
+    for(uint8_t i = 0; i < MOTOR_COUNT; i++) setPulse(MOTOR_PWM[i], Esc::PULSE_MAX);
+    for(uint8_t i = 0; i < MOTOR_COUNT; i++) s_out[i] = Esc::OUT_MAX;
     Serial.println("  請在接下來 6 秒內『關電調電源 → 再上電』");
     Serial.println("  (上電後若聽到『嗶嗶嗶』即進入校準;馬達不該轉)");
     for(int i = 6; i > 0; i--) {
@@ -262,9 +277,8 @@ static bool runThrottleCal() {
     Serial.println("  繼續高油門 2s 記高端點 …(期待『嗶』)");
     delay(2000);
     // 3) 回 0% 收低端點(當下電調原在高端,回低 = 設定 0% 邊界)
-    setPulse(Pin::MOTOR_A_PWM, Esc::PULSE_MIN);
-    setPulse(Pin::MOTOR_B_PWM, Esc::PULSE_MIN);
-    s_outA = s_outB = 0;
+    for(uint8_t i = 0; i < MOTOR_COUNT; i++) setPulse(MOTOR_PWM[i], Esc::PULSE_MIN);
+    for(uint8_t i = 0; i < MOTOR_COUNT; i++) s_out[i] = 0;
     Serial.println("  回 0% (1000µs) 記低端點 …(期待『嗶嗶』)");
     delay(1500);
     Serial.println("  校準完成(設定即存於電調 EEPROM)。");
@@ -302,6 +316,18 @@ static bool opEq(const char *op, const char *w) {
     return *op == '\0' && *w == '\0';
 }
 
+// 印出三顆目前狀態（R 命令與微調共用）
+static void printStatus() {
+    for(uint8_t i = 0; i < MOTOR_COUNT; i++) {
+        Serial.printf("   %c: %d%% (~%uµs)\r\n", static_cast<char>('A' + i),
+                      (int)outToPct(s_out[i]), (unsigned)outToPulse(s_out[i]));
+    }
+    Serial.printf("   目標 A %d%% / B %d%% / C %d%%   ACC %d %%/s  DEC %d %%/s\r\n",
+                  (int)s_cmd[0], (int)s_cmd[1], (int)s_cmd[2],
+                  (int)(s_rampUp / Esc::OUT_SCALE),
+                  (int)(s_rampDown / Esc::OUT_SCALE));
+}
+
 // 命令主入口 —— 以「字首單字(不區大小寫)+ 可選數字」分派,乾淨解決 A/ALL 歧義
 static void handleCommand() {
     Serial.println();
@@ -309,12 +335,12 @@ static void handleCommand() {
     // 特殊純符號: 以 + / - / 0 開頭
     char first = s_line[0];
     if(first == '+' || first == '-' || first == '0') {
-        if(first == '0') { // 整列以 0 開頭 → 緩降停(兩顆回0)
-            int32_t maxOut = (s_outA > s_outB) ? s_outA : s_outB;
-            s_cmdA = s_cmdB = 0;
-            // s_rampDown 單位 0.001%/s、maxOut 單位 0.001% → 比值即秒數(×10 取一位)
-            int32_t etaTenths = (s_rampDown > 0) ? (maxOut * 10) / s_rampDown : 0;
-            Serial.printf("兩顆緩降至 0%%（DEC %d %%/s → 約 %d.%ds）\r\n",
+        if(first == '0') { // 整列以 0 開頭 → 緩降停(三顆回0)
+            int32_t mOut = maxOut();
+            for(uint8_t i = 0; i < MOTOR_COUNT; i++) s_cmd[i] = 0;
+            // s_rampDown 單位 0.001%/s、mOut 單位 0.001% → 比值即秒數(×10 取一位)
+            int32_t etaTenths = (s_rampDown > 0) ? (mOut * 10) / s_rampDown : 0;
+            Serial.printf("三顆緩降至 0%%（DEC %d %%/s → 約 %d.%ds）\r\n",
                           (int)(s_rampDown / Esc::OUT_SCALE),
                           (int)(etaTenths / 10), (int)(etaTenths % 10));
             return;
@@ -325,11 +351,12 @@ static void handleCommand() {
         while(*np == ' ' || *np == '\t') np++;
         if(parseNum(np, tmp) && tmp >= 0 && tmp <= 100) delta = tmp;
         int16_t d = (first == '+') ? delta : -delta;
-        s_cmdA = static_cast<int16_t>(outToPct(s_outA) + d);
-        s_cmdB = static_cast<int16_t>(outToPct(s_outB) + d);
-        if(s_cmdA < 0) s_cmdA = 0;
-        if(s_cmdB < 0) s_cmdB = 0;
-        Serial.printf("微調 → A %d%%  B %d%%（斜坡中）\r\n", (int)s_cmdA, (int)s_cmdB);
+        for(uint8_t i = 0; i < MOTOR_COUNT; i++) {
+            s_cmd[i] = static_cast<int16_t>(outToPct(s_out[i]) + d);
+            if(s_cmd[i] < 0) s_cmd[i] = 0;
+        }
+        Serial.printf("微調 → A %d%%  B %d%%  C %d%%（斜坡中）\r\n", (int)s_cmd[0],
+                      (int)s_cmd[1], (int)s_cmd[2]);
         return;
     }
 
@@ -343,23 +370,18 @@ static void handleCommand() {
     // 純字面(無需數字)命令
     if(opEq(s_op, "H") || opEq(s_op, "?")) { printHelp(); return; }
     if(opEq(s_op, "R")) {
-        Serial.printf("   A: %d%% (~%uµs)   B: %d%% (~%uµs)\r\n",
-                      (int)outToPct(s_outA), (unsigned)outToPulse(s_outA),
-                      (int)outToPct(s_outB), (unsigned)outToPulse(s_outB));
-        Serial.printf("   目標 A %d%% / B %d%%   ACC %d %%/s  DEC %d %%/s\r\n",
-                      (int)s_cmdA, (int)s_cmdB,
-                      (int)(s_rampUp / Esc::OUT_SCALE),
-                      (int)(s_rampDown / Esc::OUT_SCALE));
+        printStatus();
         return;
     }
-    if(opEq(s_op, "X")) { // 兩顆立即斷油（真急停）
-        s_cmdA = 0; s_cmdB = 0;
-        hardIdle(Pin::MOTOR_A_PWM, s_outA);
-        hardIdle(Pin::MOTOR_B_PWM, s_outB);
-        Serial.println("急停：兩顆立即回 0%（1000µs 熄火，不經斜坡）");
+    if(opEq(s_op, "X")) { // 三顆立即斷油（真急停）
+        for(uint8_t i = 0; i < MOTOR_COUNT; i++) {
+            s_cmd[i] = 0;
+            hardIdle(i);
+        }
+        Serial.println("急停：三顆立即回 0%（1000µs 熄火，不經斜坡）");
         return;
     }
-    if(opEq(s_op, "CAL") || opEq(s_op, "C")) {
+    if(opEq(s_op, "CAL")) { // 注意：'C' 已被馬達 C 使用，校準只認 CAL
         runThrottleCal();
         return;
     }
@@ -380,7 +402,7 @@ static void handleCommand() {
         return;
     }
 
-    // 剩下帶數字的出力指令（A/B/ALL）
+    // 剩下帶數字的出力指令（A/B/C/ALL）
     int16_t pct = 0;
     if(!parseNum(s_num, pct)) {
         Serial.println("?? 數字無效／負值(單向)或指令不符，鍵入 'h'");
@@ -389,14 +411,17 @@ static void handleCommand() {
     if(pct > Esc::MAX_PCT) pct = Esc::MAX_PCT;
 
     if(opEq(s_op, "A") || opEq(s_op, "1")) {
-        s_cmdA = pct;
-        Serial.printf("馬達A → %d%%（緩慢趨近中）\r\n", (int)s_cmdA);
+        s_cmd[0] = pct;
+        Serial.printf("馬達A → %d%%（緩慢趨近中）\r\n", (int)s_cmd[0]);
     } else if(opEq(s_op, "B") || opEq(s_op, "2")) {
-        s_cmdB = pct;
-        Serial.printf("馬達B → %d%%（緩慢趨近中）\r\n", (int)s_cmdB);
+        s_cmd[1] = pct;
+        Serial.printf("馬達B → %d%%（緩慢趨近中）\r\n", (int)s_cmd[1]);
+    } else if(opEq(s_op, "C") || opEq(s_op, "3")) {
+        s_cmd[2] = pct;
+        Serial.printf("馬達C → %d%%（緩慢趨近中）\r\n", (int)s_cmd[2]);
     } else if(opEq(s_op, "ALL") || opEq(s_op, "L")) {
-        s_cmdA = pct; s_cmdB = pct;
-        Serial.printf("兩顆同→ %d%%（緩慢趨近中）\r\n", (int)pct);
+        for(uint8_t i = 0; i < MOTOR_COUNT; i++) s_cmd[i] = pct;
+        Serial.printf("三顆同→ %d%%（緩慢趨近中）\r\n", (int)pct);
     } else {
         Serial.println("?? 未知命令，鍵入 'h' 看用法");
     }
@@ -410,21 +435,21 @@ void setup() {
     Serial.begin(115200);
     delay(150);
     Serial.println();
-    Serial.println("[esc_test] 單向無刷馬達 (Skywalker 油門) 測試");
+    Serial.println("[esc_test] 單向無刷馬達 (Skywalker 油門) 測試 — 三顆");
 
-    setupPwm(Pin::MOTOR_A_PWM);
-    setupPwm(Pin::MOTOR_B_PWM);
+    for(uint8_t i = 0; i < MOTOR_COUNT; i++) setupPwm(MOTOR_PWM[i]);
 
     // 上電即 0% → 1000µs→熄火;等待電調辨識解鎖
-    hardIdle(Pin::MOTOR_A_PWM, s_outA);
-    hardIdle(Pin::MOTOR_B_PWM, s_outB);
-    s_cmdA = 0; s_cmdB = 0;
+    for(uint8_t i = 0; i < MOTOR_COUNT; i++) {
+        hardIdle(i);
+        s_cmd[i] = 0;
+    }
 
     // 給電調完成「上電低電位解鎖」的穩定時間(不可在此段抬油門)
     delay(3000);
 
     printHelp();
-    Serial.println("已就緒：兩顆 0% (1000µs 熄火) 待命。");
+    Serial.println("已就緒：三顆 0% (1000µs 熄火) 待命。");
 }
 
 void loop() {
@@ -439,8 +464,7 @@ void loop() {
     if(dtUs > 100000) dtUs = 100000; // 過長（如 CAL 後）夾住，避免跳級
     lastTickUs = nowUs;
 
-    slewToward(Pin::MOTOR_A_PWM, s_outA, s_cmdA, dtUs);
-    slewToward(Pin::MOTOR_B_PWM, s_outB, s_cmdB, dtUs);
+    for(uint8_t i = 0; i < MOTOR_COUNT; i++) slewToward(i, s_cmd[i], dtUs);
 
     if(pollLine()) {
         handleCommand();
