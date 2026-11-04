@@ -195,6 +195,13 @@ class SlaveComms {
     /// 收到有效控制幀的總次數（除錯用）
     uint32_t validCmdCount() const { return validCmdCount_; }
 
+    // ---- RX 診斷（轉發自 ChassisComms，供序列監控確認「到底有沒有收到」）----
+    uint32_t rxFrameCount() const { return hubComms_.rxFrameCount(); }
+    uint32_t rxCrcErrorCount() const { return hubComms_.rxCrcErrorCount(); }
+    uint8_t lastRxMsgType() const { return hubComms_.lastRxMsgType(); }
+    uint8_t lastRxTargetID() const { return hubComms_.lastRxTargetID(); }
+    uint8_t lastRxFrameSeq() const { return hubComms_.lastRxFrameSeq(); }
+
     /// 取得 ChassisComms 參考（用於自訂收發）
     ChassisComms &comms() { return hubComms_; }
 
@@ -225,10 +232,13 @@ class SlaveComms {
             return;
         }
 
-        // Reboot 指令 — Hub 偵測到本 Slave 遙測逾時時發送
+        // Reboot 指令 — Hub 偵測到本 Slave 遙測逾時時發送。
+        // 只接受「指定本機」或「廣播」的 REBOOT，避免誤重開別台。
         if(pkt.msgType == MsgType::REBOOT) {
-            if(instance_ != nullptr)
+            if(pkt.targetID == app_->targetID ||
+               pkt.targetID == TargetID::BROADCAST) {
                 instance_->rebootRequested_ = true;
+            }
             return;
         }
 

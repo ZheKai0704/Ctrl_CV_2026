@@ -16,24 +16,32 @@
 ;   - One SM per encoder -> 4 SMs on PIO0, per CLAUDE.md ("PIO0 all 4 SM encoder").
 ;   - Minimal PIO: loop reads pins, skips if unchanged, pushes phase otherwise.
 ;
+; ⚠ ISR 必須每個 sample 先清零（mov isr, null）：
+;   `in pins,2` 是「移位」進 ISR（shift_left），不是覆寫。若不清零，ISR 會
+;   累積歷史相位，`mov x, osr` / `mov y, isr` 的 32-bit 比較幾乎永遠不相等
+;   → 每個 sample 都 push（60kHz）→ RX FIFO 永遠滿 → 真正相位跳變被丟棄
+;   → 轉速量測時高時低、時正時負 → PID 爆衝 / 馬達不動。
+;
 ; Wireup:
 ;   sm_config_set_in_pins(base = encoder A pin)  => bit0 = A, bit1 = B
 ;
-; 7 instructions.
+; 8 instructions / loop; SM clock 150MHz/clkdiv.
+;   clkdiv=500 -> 300kHz SM clock, ~60kHz phase sampling (5 cycles/loop).
 ;
 
 .program quad_phase
 
-; OSR = previous phase (persist). X = prev, copied at loop top.
+; X = previous phase (persist in OSR). ISR is cleared every sample so `in`
+; produces exactly the current 2-bit phase.
 .wrap_target
 top:
-    mov x, osr          ; 0.  x = prev phase
-    in pins, 2          ; 1.  isr = cur phase (bit0=A, bit1=B)
-    mov y, isr          ; 2.  y = cur
-    jmp x != y, do_push ; 3.  changed -> push
-    jmp top             ; 4.  no change -> loop
+    mov x, osr          ; 0. x = prev phase
+    mov isr, null       ; 1. clear ISR (in 是移位，不是覆寫)
+    in pins, 2          ; 2. isr = cur phase (bit0=A, bit1=B)
+    mov y, isr          ; 3. y = cur
+    jmp x != y, do_push ; 4. changed -> push
+    jmp top             ; 5. no change -> loop
 do_push:
-    mov osr, y          ; 5.  prev = cur (for next)
-    mov isr, y          ; 6.  isr = cur (value to push)
-    push                ; 7.  push phase to RX FIFO, wrap to top
+    mov osr, y          ; 6. prev = cur (for next)
+    push                ; 7. push phase to RX FIFO, wrap to top
 .wrap

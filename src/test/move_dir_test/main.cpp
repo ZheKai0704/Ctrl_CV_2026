@@ -5,7 +5,7 @@
 //   FR: DIR=8  PWM=9  ENC=14,15
 //   FL: DIR=6  PWM=7  ENC=16,17
 //   BL: DIR=12 PWM=13 ENC=18,19
-//   BR: DIR=11 PWM=10 ENC=20,21
+//   BR: PWM=11 DIR=10 ENC=20,21
 // 之後，用序列埠即時指令驗證：
 //   1. 每顆輪子單獨轉動的方向
 //   2. 四輪同動（前後 / 左右平移 / 旋轉）時方向是否一致
@@ -119,7 +119,7 @@ static float axisRot = Cfg::AXIS_ROT_POL;
 //   預設先沿用舊板實測值 {+1,-1,+1,-1}，可用指令即時修改
 // ============================================================================
 static int8_t motorPol[4] = {1, 1, -1, -1};
-static int8_t encPol[4] = {1, -1, -1, -1};
+static int8_t encPol[4] = {1, -1, +1, -1};
 
 // ============================================================================
 // 輸出狀態
@@ -1025,7 +1025,7 @@ void setup() {
     Serial.println(F("   FR DIR=8  PWM=9  ENC=14/15"));
     Serial.println(F("   FL DIR=6  PWM=7  ENC=16/17"));
     Serial.println(F("   BL DIR=12 PWM=13 ENC=18/19"));
-    Serial.println(F("   BR DIR=11 PWM=10 ENC=20/21"));
+    Serial.println(F("   BR PWM=11 DIR=10 ENC=20/21"));
     Serial.println(F(" 建議流程：fwd 25 → pol 修正 → cal → left/right/cw/ccw → report"));
     Serial.println(F(" 輸入 help 看指令。"));
     Serial.println(F("=================================================="));

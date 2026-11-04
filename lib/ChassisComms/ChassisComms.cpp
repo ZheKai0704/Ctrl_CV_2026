@@ -1,4 +1,5 @@
 #include "ChassisComms.h"
+#include <cstring>
 
 ChassisComms::ChassisComms(Stream *stream,
                            uint8_t hbTarget,
@@ -36,6 +37,12 @@ void ChassisComms::processFrame(const uint8_t *data, size_t len) {
     if(pkt.sync != 0xA5)
         return;
 
+    // RX 診斷：記錄最後一個通過 CRC 的幀（Core 0 寫入，Core 0 讀取）
+    rxFrameCount_++;
+    lastMsgType_ = pkt.msgType;
+    lastTargetID_ = pkt.targetID;
+    lastFrameSeq_ = pkt.frameSeq;
+
     // E-Stop 為中斷事件：跳過幀序號去重，每次都必須傳遞（CLAUDE.md §E-Stop）
     if(pkt.msgType == MsgType::ESTOP) {
         if(frameCb != nullptr)
@@ -57,9 +64,20 @@ bool ChassisComms::sendTelemetry(const MoveTelemetry &telemetry) {
     if(stream == nullptr)
         return false;
 
+    // 集中戳記標頭 + CRC：呼叫端就算忘了填 sync/msgType/targetID/crc16，
+    // 送出的遙測仍能通過 Hub 的 CRC 驗證（Move 端曾漏填 → Hub 全部丟棄）。
+    MoveTelemetry tm = telemetry;
+    tm.sync = 0xA5;
+    tm.msgType = MsgType::TELEMETRY;
+    tm.targetID = TargetID::HUB;
+    tm.frameSeq = telemetrySeq++;
+    tm.crc16 = 0;
+    tm.crc16 = SignalUtils::calculateCrc(
+        reinterpret_cast<const uint8_t *>(&tm), sizeof(MoveTelemetry) - 2);
+
     uint8_t cobsBuf[sizeof(MoveTelemetry) + 2];
     size_t cobsLen = SignalUtils::cobsEncode(
-        reinterpret_cast<const uint8_t *>(&telemetry),
+        reinterpret_cast<const uint8_t *>(&tm),
         sizeof(MoveTelemetry),
         cobsBuf);
     cobsBuf[cobsLen] = 0x00;
@@ -74,9 +92,16 @@ bool ChassisComms::sendTelemetry(const MoveTelemetry &telemetry) {
     return written == totalBytes;
 }
 
-bool ChassisComms::sendPacket(const ControlPacket &pkt) {
+bool ChassisComms::sendPacket(const ControlPacket &source) {
     if(stream == nullptr)
         return false;
+
+    // 集中戳記 CRC：確保送出的每一幀都帶正確校驗值。
+    // （呼叫端可自行先填，重算結果相同；漏填時也不會送出壞幀）
+    ControlPacket pkt = source;
+    pkt.crc16 = 0;
+    pkt.crc16 = SignalUtils::calculateCrc(
+        reinterpret_cast<const uint8_t *>(&pkt), sizeof(ControlPacket) - 2);
 
     uint8_t cobsBuf[sizeof(ControlPacket) + 2];
     size_t cobsLen = SignalUtils::cobsEncode(
@@ -124,16 +149,18 @@ void ChassisComms::update() {
                                                             decoded);
                     if(decLen >= sizeof(ControlPacket)) {
                         // CRC 計算範圍：整個解碼後的資料除去尾部2 bytes (crc16)
-                        uint16_t storedCrc =
-                            reinterpret_cast<const uint16_t *>(
-                                decoded + decLen - 2)[0];
+                        // 用 memcpy 取值，避免 unaligned 讀取告警。
+                        uint16_t storedCrc = 0;
+                        memcpy(&storedCrc, decoded + decLen - 2, sizeof(uint16_t));
                         uint16_t calcCrc = SignalUtils::calculateCrc(
                             decoded,
                             decLen - 2);
                         if(storedCrc == calcCrc) {
                             processFrame(decoded, decLen);
+                        } else {
+                            // CRC 失敗 → 靜默丟棄 (CLAUDE.md 規則)，僅計數供診斷
+                            rxCrcErrorCount_++;
                         }
-                        // CRC 失敗 → 靜默丟棄 (CLAUDE.md 規則)
                     }
                 }
                 workBufIdx = 0;
@@ -152,19 +179,14 @@ void ChassisComms::update() {
     if(now - lastHeartbeatTime >= hbIntervalUs) {
         lastHeartbeatTime = now;
 
-        ControlPacket pkt;
+        // 注意：必須值初始化，否則 payload 後 9 bytes 是未定義的堆疊殘值，
+        // 會帶著垃圾資料上線（CRC 仍正確，但內容不該外洩）。
+        ControlPacket pkt = {};
         pkt.sync = 0xA5;
         pkt.msgType = MsgType::HEARTBEAT;
         pkt.frameSeq = txFrameSeq++;
         pkt.targetID = hbTargetID;
         pkt.payloadLen = sizeof(ControlPacket) - 6 - 2;
-        pkt.move.vx = 0;
-        pkt.move.vy = 0;
-        pkt.move.omega = 0;
-
-        pkt.crc16 = SignalUtils::calculateCrc(
-            reinterpret_cast<uint8_t *>(&pkt),
-            sizeof(ControlPacket) - 2);
 
         sendPacket(pkt);
     }

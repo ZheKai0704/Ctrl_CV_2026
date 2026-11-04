@@ -372,20 +372,31 @@ UART0 @ 420000 baud
 |------|------|------|-----------|
 | CH1 (Roll) | rc_channels[0] | vx（左右平移） | Move |
 | CH2 (Pitch) | rc_channels[1] | vy（前後移動） | Move |
-| CH3 (Throttle) | rc_channels[2] | upSpeed（上射速度） | Shoot |
-| CH4 (Yaw) | rc_channels[3] | omega（旋轉） | Move |
+| CH8 | rc_channels[7] | omega（cw/ccw 旋轉） | Move |
+| CH3 | rc_channels[2] | upSpeed（上射速度） | Shoot |
 | CH5 | rc_channels[4] | downSpeed（下射速度） | Shoot |
 | CH7 | rc_channels[6] | pitch（俯仰） | Shoot |
-| CH8 | rc_channels[7] | row（旋轉） | Shoot |
+| CH8 | — | row（與 Move 的 omega 同通道，目前 `RC_FORWARD_SHOOT=false` 不轉發） | Shoot（未啟用） |
 | CH9 | rc_channels[8] | motorChannel（PCA9685 通道 0~15） | Storage |
 | CH10 | rc_channels[9] | trigger（0/1） | Storage |
+
+> Hub 端 `src/hub/main.cpp` 的 `RcMap` 集中管理通道與方向：
+> `VX=0 (CH1)`、`VY=1 (CH2)`、`OMEGA=7 (CH8)`；
+> **方向（實機實測）：`VX_SIGN=-1`、`VY_SIGN=+1`、`OMEGA_SIGN=-1`。**
+> 若旋轉改到 CH4，把 `OMEGA` 改成 `3` 即可。
+>
+> Move 速度刻度（`RcMoveCfg`）：`FULL_TRANSLATE_RPS=1.20`、`FULL_OMEGA=7.00`；
+> 死區 ±10 後重新映射 0~100，避免過死區時跳動。
+> 這些方向修正只影響 **RC 備援路徑**，Jetson 自駕送來的 vx/vy/omega 不受影響。
 
 ### 備援邏輯
 
 1. Jetson 正常發送 → Core 0 直接轉發至 Slaves（自動模式）
-2. Jetson 逾時（>500ms）→ Core 0 改用 Core 1 的 RC 數據（備援）
+2. Jetson 逾時（>500ms）→ Core 0 改用 Core 1 的 RC 數據（備援），約 100Hz
 3. RC 也斷線（Failsafe）→ 發送 E-Stop 廣播至所有 Slaves
 4. 死區濾波：-10~10 → 0，避免微小抖動
+5. `RC_FORWARD_SHOOT=false`：RC 備援時不同時轉發 Shoot，避免推油門時
+   發射無刷一起全速造成電流下陷、四輪出力不一致（直走會偏）
 
 ---
 
@@ -401,13 +412,13 @@ UART0 @ 420000 baud
 - UART0 映射: TX: GP0, RX: GP1 (與 Hub 通訊)
 - 馬達驅動型式: 硬體 PWM + DIR (非 PIO PWM)
 - 四輪腳位（2026 新板，`src/move/main.cpp` `Pin` namespace，move_pinmap / move_dir_test 實測）:
-  **FR(DIR:GP8, PWM:GP9), FL(DIR:GP6, PWM:GP7), BL(DIR:GP12, PWM:GP13), BR(DIR:GP11, PWM:GP10)**
+  **FR(DIR:GP8, PWM:GP9), FL(DIR:GP6, PWM:GP7), BL(DIR:GP12, PWM:GP13), BR(DIR:GP10, PWM:GP11)**
 - 四輪編碼器 PIO 腳位（實測，A=較小腳）:
   FR(A:GP14, B:GP15), FL(A:GP16, B:GP17), BL(A:GP18, B:GP19), BR(A:GP20, B:GP21)
 - PIO 資源: PIO0 全部 4 SM 做 Encoder，PIO1 未使用
 - 馬達參數: 1:27 減速比, 實測線數 `ENC_LINE_PPR = 443` (軟體常數 `ENC_COUNTS_PER_REV = 443 * 4 = 1772`)
 - 車身參數: HALF_LENGTH=0.25m, HALF_WIDTH=0.25m, WHEEL_RADIUS=0.05m
-- 馬達極性/編碼器方向（move_dir_test 實測）: `kWheelPolarity[]` = `{1,1,-1,-1}` [FL,FR,BL,BR]; `kEncReadPolarity[]` = `{1,-1,-1,-1}`; 車身軸方向開關 `kAxisStrafePolarity=-1`（新板左右平移相反）, `kAxisForwardPolarity=-1`
+- 馬達極性/編碼器方向（move_drive_test 實測）: `kWheelPolarity[]` = `{1,1,-1,-1}` [FL,FR,BL,BR]; `kEncReadPolarity[]` = `{1,-1,+1,+1}`; 車身軸方向開關 `kAxisStrafePolarity=-1`（新板左右平移相反）, `kAxisForwardPolarity=-1`
 - 車身三軸 S 曲線速度剖面（jerk-limited 非對稱加/減速）: 加速 4.0, 減速 12.0, Jerk 60.0 RPS/s²
 - 閉迴路 PID 上限: `PID_MAX_DUTY=100%`，積分風扇餘裕 `WINDUP_MARGIN_DUTY=6%`
 - 期望控制週期: 由 Jetson/Hub 控制幀頻率決定（典型 10–20ms）

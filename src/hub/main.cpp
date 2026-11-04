@@ -76,9 +76,12 @@ static constexpr uint8_t PIN_STORAGE_RX = 7;
 
 // earlephilhower SerialPIO：每個 slave 一個實例，各自使用獨立的 PIO SM。
 // SerialPIO(txPin, rxPin, fifoSize)
-static SerialPIO moveUart(PIN_MOVE_TX, PIN_MOVE_RX);          // TX=GP2, RX=GP3
-static SerialPIO shootUart(PIN_SHOOT_TX, PIN_SHOOT_RX);       // TX=GP4, RX=GP5
-static SerialPIO storageUart(PIN_STORAGE_TX, PIN_STORAGE_RX); // TX=GP6, RX=GP7
+//   fifoSize 預設只有 32 bytes → 一旦 loop() 被 Serial.printf / USB CDC 阻塞
+//   ~350us 就會掉位元組，造成遙測 COBS 解碼失敗、CRC mismatch。
+//   放大到 256 bytes（約 2.8ms @921600）給予足夠餘裕。
+static SerialPIO moveUart(PIN_MOVE_TX, PIN_MOVE_RX, 256);          // TX=GP2, RX=GP3
+static SerialPIO shootUart(PIN_SHOOT_TX, PIN_SHOOT_RX, 256);       // TX=GP4, RX=GP5
+static SerialPIO storageUart(PIN_STORAGE_TX, PIN_STORAGE_RX, 256); // TX=GP6, RX=GP7
 
 // ============================================================================
 // PIO UART RX 接收緩衝區 — 每個 slave 獨立靜態緩衝區
@@ -89,6 +92,7 @@ static constexpr uint16_t PIO_RX_BUF_SIZE = 512;
 struct PioRxBuffer {
     uint8_t buf[PIO_RX_BUF_SIZE];
     uint16_t len;
+    uint64_t lastLogUs; // 日誌節流（避免 Slave 心跳/遙測把監控洗版）
 };
 
 static PioRxBuffer moveRxBuf;
@@ -153,7 +157,11 @@ static size_t cobsDecodeInline(const uint8_t *src, size_t len, uint8_t *dst,
 // 從指定 SerialPIO 讀取可用位元組，暫存至對應的 PioRxBuffer。
 // 遇到 0x00 終止符時進行 COBS 解碼 + CRC 驗證：
 //   - 72 bytes + TELEMETRY → 存入 telemetryOut，更新 lastTmUs
-//   - 20 bytes + CONTROL/ESTOP/HEARTBEAT → Serial.printf log（保留除錯用）
+//   - 20 bytes + CONTROL/REBOOT/ESTOP → 更新狀態（日誌節流）
+//   - HEARTBEAT（Slave 每 30ms 一次）→ 只更新狀態，不洗版
+//
+// 日誌策略：正常封包每秒最多印一次摘要；錯誤（CRC/解碼失敗）節流 500ms，
+// 避免把序列監控塞滿而看不到真正重要的訊息。
 // ============================================================================
 static void processPioRx(SerialPIO &uart, PioRxBuffer &rxBuf, const char *name,
                          MoveTelemetry &telemetryOut, uint64_t &lastTmUs) {
@@ -166,59 +174,92 @@ static void processPioRx(SerialPIO &uart, PioRxBuffer &rxBuf, const char *name,
                 continue;
             }
 
+            const uint64_t nowUs = time_us_64();
+
             // COBS 解碼
             uint8_t decoded[512];
             size_t decodedLen = cobsDecodeInline(rxBuf.buf, rxBuf.len, decoded,
                                                  sizeof(decoded));
 
             if(decodedLen == 0) {
-                Serial.printf("[PIO RX][%s] COBS decode fail: bufLen=%u\n",
-                              name, rxBuf.len);
+                if(nowUs - rxBuf.lastLogUs > 500000ULL) {
+                    rxBuf.lastLogUs = nowUs;
+                    Serial.printf("[PIO RX][%s] COBS decode fail: bufLen=%u\n",
+                                  name, rxBuf.len);
+                }
                 rxBuf.len = 0;
                 continue;
             }
 
-            // CRC 驗證
-            if(decodedLen <
-               8) { // 最小:
-                // sync(1)+msgType(1)+frameSeq(1)+targetID(1)+payloadLen(2)+crc16(2)
-                Serial.printf("[PIO RX][%s] too short: %zu bytes\n", name,
-                              decodedLen);
+            // 最小長度: sync+msgType+frameSeq+targetID+payloadLen+crc16 = 8
+            if(decodedLen < 8) {
+                if(nowUs - rxBuf.lastLogUs > 500000ULL) {
+                    rxBuf.lastLogUs = nowUs;
+                    Serial.printf("[PIO RX][%s] too short: %zu bytes\n", name,
+                                  decodedLen);
+                }
                 rxBuf.len = 0;
                 continue;
             }
 
-            uint16_t storedCrc =
+            const uint16_t storedCrc =
                 static_cast<uint16_t>(decoded[decodedLen - 2]) |
                 (static_cast<uint16_t>(decoded[decodedLen - 1]) << 8);
-            uint16_t calcCrc =
+            const uint16_t calcCrc =
                 SignalUtils::calculateCrc(decoded, decodedLen - 2);
 
             if(calcCrc != storedCrc) {
-                Serial.printf(
-                    "[PIO RX][%s] CRC mismatch (calc=0x%04X, stored=0x%04X)\n",
-                    name, calcCrc, storedCrc);
+                // 常見原因：Slave 端送出的封包沒有戳 CRC（如 Move 遙測漏填）
+                if(nowUs - rxBuf.lastLogUs > 500000ULL) {
+                    rxBuf.lastLogUs = nowUs;
+                    Serial.printf("[PIO RX][%s] CRC mismatch (calc=0x%04X, "
+                                  "stored=0x%04X, len=%zu)\n",
+                                  name, calcCrc, storedCrc, decodedLen);
+                }
                 rxBuf.len = 0;
                 continue;
             }
 
-            // CRC 通過 — 依大小分發
-            if(decodedLen == sizeof(MoveTelemetry)) {
+            // 標頭檢查：sync 必須為 0xA5，否則視為雜訊丟棄
+            if(decoded[0] != 0xA5) {
+                if(nowUs - rxBuf.lastLogUs > 500000ULL) {
+                    rxBuf.lastLogUs = nowUs;
+                    Serial.printf("[PIO RX][%s] bad sync 0x%02X\n", name,
+                                  decoded[0]);
+                }
+                rxBuf.len = 0;
+                continue;
+            }
+
+            const uint8_t msgType = decoded[1];
+
+            // CRC 通過 — 依 msgType / 大小分發
+            if(msgType == MsgType::TELEMETRY &&
+               decodedLen == sizeof(MoveTelemetry)) {
                 // 遙測封包 (72 bytes)
                 memcpy(&telemetryOut, decoded, sizeof(MoveTelemetry));
-                lastTmUs = time_us_64();
-                Serial.printf(
-                    "[PIO RX][%s] telemetry OK: frameSeq=%d, timestamp=%lu\n",
-                    name, telemetryOut.frameSeq,
-                    static_cast<unsigned long>(telemetryOut.timestamp));
+                lastTmUs = nowUs;
+                if(nowUs - rxBuf.lastLogUs > 1000000ULL) {
+                    rxBuf.lastLogUs = nowUs;
+                    Serial.printf("[PIO RX][%s] telemetry OK: seq=%d t=%lu\n",
+                                  name, telemetryOut.frameSeq,
+                                  static_cast<unsigned long>(
+                                      telemetryOut.timestamp));
+                }
             } else if(decodedLen >= sizeof(ControlPacket)) {
-                // 控制/心跳/E-Stop 封包 (20 bytes)
+                // 控制/心跳/Reboot/E-Stop 封包 (20 bytes)
                 const ControlPacket &pkt =
                     *reinterpret_cast<const ControlPacket *>(decoded);
-                Serial.printf(
-                    "[PIO RX][%s] pkt: msgType=%d, frameSeq=%d, targetID=%d\n",
-                    name, pkt.msgType, pkt.frameSeq, pkt.targetID);
-            } else {
+                // 心跳每 30ms 一次 → 只節流記錄，不洗版
+                if(pkt.msgType != MsgType::HEARTBEAT &&
+                   nowUs - rxBuf.lastLogUs > 1000000ULL) {
+                    rxBuf.lastLogUs = nowUs;
+                    Serial.printf(
+                        "[PIO RX][%s] pkt: msgType=%d seq=%d targetID=%d\n",
+                        name, pkt.msgType, pkt.frameSeq, pkt.targetID);
+                }
+            } else if(nowUs - rxBuf.lastLogUs > 500000ULL) {
+                rxBuf.lastLogUs = nowUs;
                 Serial.printf("[PIO RX][%s] unknown frame: %zu bytes\n", name,
                               decodedLen);
             }
@@ -312,8 +353,98 @@ static CrsfReceiver crsf;
 // Core 0 內部狀態 — Jetson 連線追蹤 & RC 備援序號
 // ============================================================================
 static uint64_t lastJetsonFrameUs = 0; // 最後收到 Jetson 有效封包的時間
+static uint32_t jetsonFrameCount = 0;  // Jetson 有效封包累計（LED 判斷用）
 static uint8_t rcFallbackSeq = 0;      // RC 備援轉發用的 frameSeq
 static uint64_t lastRcForwardUs = 0;   // RC 備援最後轉發時間
+
+// ============================================================================
+// 狀態 LED（板載 LED_BUILTIN）— 與 Move Slave 相同的顯示邏輯
+//
+//   * E-Stop（Jetson 逾時且 RC Failsafe）→ 長亮
+//   * 剛開機、從未收到 Jetson 幀 → 長亮
+//   * 資料通訊中（< ACTIVE_TIMEOUT_MS）→ 1Hz 短脈衝
+//   * 已連線但 Idle（Jetson 暫停送資料、RC 仍正常）→ 0.5Hz 慢閃
+// ============================================================================
+namespace LedCfg {
+// 視為「資料通訊中」的視窗（略大於典型控制週期，避免閃斷）
+constexpr uint32_t ACTIVE_TIMEOUT_MS = 150;
+
+// 已連線 + 資料通訊中：1Hz 短脈衝心跳（像路由器資料燈）
+constexpr uint32_t ACTIVE_ON_MS = 80;
+constexpr uint32_t ACTIVE_OFF_MS = 920;
+
+// 已連線但 Idle：0.5Hz 慢閃，鎮定不擾人
+constexpr uint32_t IDLE_ON_MS = 500;
+constexpr uint32_t IDLE_OFF_MS = 1500;
+} // namespace LedCfg
+
+enum class LedState : uint8_t { BOOT = 0, ESTOP = 1, IDLE = 2, ACTIVE = 3 };
+
+static const char *ledStateName(LedState st) {
+    switch(st) {
+    case LedState::BOOT:
+        return "BOOT";
+    case LedState::ESTOP:
+        return "ESTOP";
+    case LedState::IDLE:
+        return "IDLE";
+    default:
+        return "ACTIVE";
+    }
+}
+
+static volatile uint8_t dbg_ledState = static_cast<uint8_t>(LedState::BOOT);
+
+static LedState currentLedState() {
+    if(jetsonFrameCount == 0)
+        return LedState::BOOT; // 開機至今從未收到 Jetson 有效幀
+    if(time_us_64() - lastJetsonFrameUs <
+       static_cast<uint64_t>(LedCfg::ACTIVE_TIMEOUT_MS) * 1000ULL)
+        return LedState::ACTIVE; // Jetson 控制流正常
+    if(rc_failsafe)
+        return LedState::ESTOP; // Jetson 斷線且遙控也斷線
+    return LedState::IDLE;      // Jetson 無資料，但遙控備援仍連線
+}
+
+static void updateStatusLed() {
+    static LedState lastState = LedState::BOOT;
+    static bool ledOn = false;
+    static uint32_t phaseStartMs = 0;
+
+    const LedState st = currentLedState();
+    const uint32_t now = millis();
+
+    dbg_ledState = static_cast<uint8_t>(st);
+
+    // 狀態切換 → 重置相位並立刻點亮（新狀態立即可見）
+    if(st != lastState) {
+        lastState = st;
+        phaseStartMs = now;
+        ledOn = true;
+        digitalWrite(LED_BUILTIN, HIGH);
+    }
+
+    // 未連線 / 剛開機 / E-Stop → 長亮
+    if(st == LedState::BOOT || st == LedState::ESTOP) {
+        digitalWrite(LED_BUILTIN, HIGH);
+        return;
+    }
+
+    uint32_t onMs = LedCfg::ACTIVE_ON_MS;
+    uint32_t offMs = LedCfg::ACTIVE_OFF_MS;
+    if(st == LedState::IDLE) {
+        onMs = LedCfg::IDLE_ON_MS;
+        offMs = LedCfg::IDLE_OFF_MS;
+    }
+
+    // 非阻塞相位推進：亮滿 onMs → 熄，熄滿 offMs → 亮
+    const uint32_t phaseMs = ledOn ? onMs : offMs;
+    if(now - phaseStartMs >= phaseMs) {
+        phaseStartMs = now;
+        ledOn = !ledOn;
+        digitalWrite(LED_BUILTIN, ledOn ? HIGH : LOW);
+    }
+}
 
 // ============================================================================
 // 轉發輔助函式：對所有 slaves 廣播一個 ControlPacket
@@ -334,7 +465,9 @@ static void forwardAllSlaves(const ControlPacket &pkt) {
 //   Move:
 //     CH1 (Roll)    → rc_channels[0] → vx       左右平移
 //     CH2 (Pitch)   → rc_channels[1] → vy       前後移動
-//     CH4 (Yaw)     → rc_channels[3] → omega    旋轉
+//     CH8           → rc_channels[7] → omega    cw/ccw 旋轉（實機接線）
+//     （文件舊版寫 CH4；可用 RcMap::OMEGA 改通道、RcMap::OMEGA_SIGN 改方向）
+//     方向實測：前後正常；左右與 cw/ccw 需反相（VX_SIGN/OMEGA_SIGN = -1）
 //
 //   Shoot:
 //     CH3 (Throttle) → rc_channels[2] → upSpeed   上射速度
@@ -360,6 +493,58 @@ static int8_t rcToInt8(int16_t ch) {
 }
 
 // ============================================================================
+// RC → Move 速度刻度
+//
+// ControlPacket.move 是 int8，SlaveComms 解碼時會乘上
+// RobotConfig::MAX_RPS/127 (≈0.0551) 變成車身 RPS。
+// 若把遙控 -100~100 直接塞進去，滿舵 = 5.5 RPS（約 1.7 m/s）太快，
+// 且四輪只要有些微摩擦差就會偏。這裡先把「想要的車身 RPS」換成線路刻度。
+// ============================================================================
+// 遙控通道索引（0-based：0=CH1 … 9=CH10）
+//   VX    CH1 Roll  → 左右平移
+//   VY    CH2 Pitch → 前後
+//   OMEGA CH8      → cw/ccw 旋轉（實機遙控器的旋轉通道；舊版 Hub 也是讀 CH8）
+//         若你的旋轉是 CH4，把 OMEGA 改成 3 即可，其餘不用動。
+namespace RcMap {
+constexpr uint8_t VX = 0;
+constexpr uint8_t VY = 1;
+constexpr uint8_t OMEGA = 7;
+// 方向修正（實機實測）：前後正常，左右與 cw/ccw 相反 → 這兩個反相。
+//   只影響「遙控備援」；Jetson/自駕送進來的 vx/omega 不受影響。
+constexpr int8_t VX_SIGN = -1;
+constexpr int8_t VY_SIGN = +1;
+constexpr int8_t OMEGA_SIGN = -1;
+} // namespace RcMap
+
+namespace RcMoveCfg {
+constexpr float FULL_TRANSLATE_RPS = 1.20f; // 前後 / 左右平移滿舵 (RPS)
+constexpr float FULL_OMEGA = 7.00f;         // 旋轉滿舵（firmware omega 刻度）
+constexpr float DEADBAND = 10.0f;           // 與 applyDeadband 相同
+} // namespace RcMoveCfg
+
+// 車身 RPS → int8 線路刻度（Slave 端再乘 MAX_RPS/127）
+static int8_t rpsToWire(float rps) {
+    float wire = rps * 127.0f / RobotConfig::MAX_RPS;
+    if(wire > 127.0f) wire = 127.0f;
+    if(wire < -127.0f) wire = -127.0f;
+    return static_cast<int8_t>(lroundf(wire));
+}
+
+// 通道 -100~100 → 線路刻度（死區後 10..100 重新映射 0..100，過死區不跳動）
+//   sign = ±1：實機方向修正（不影響 Jetson 路徑）
+static int8_t rcAxisToWire(int16_t ch, float fullRange, int8_t sign = 1) {
+    const float v = static_cast<float>(applyDeadband(ch));
+    if(v == 0.0f)
+        return 0;
+    const float span = 100.0f - RcMoveCfg::DEADBAND;
+    float mag = (fabsf(v) - RcMoveCfg::DEADBAND) / span;
+    if(mag < 0.0f) mag = 0.0f;
+    if(mag > 1.0f) mag = 1.0f;
+    return rpsToWire((v > 0.0f ? mag : -mag) * fullRange *
+                     static_cast<float>(sign));
+}
+
+// ============================================================================
 // RC → Move ControlPacket
 // ============================================================================
 static ControlPacket rcToMovePacket() {
@@ -370,9 +555,17 @@ static ControlPacket rcToMovePacket() {
     pkt.targetID = TargetID::MOVE;
     pkt.payloadLen = sizeof(ControlPacket) - 6 - 2;
 
-    pkt.move.vx = rcToInt8(rc_channels[1]);    // CH1 → vx
-    pkt.move.vy = rcToInt8(rc_channels[0]);    // CH0 → vy
-    pkt.move.omega = rcToInt8(rc_channels[7]); // CH7 → omega
+    // ⚠ 舊版把 vx/vy 對調（推前進變橫移）。omega 依實機接線使用 CH8
+    //    （cw/ccw 旋轉），可用上面 RcMap::OMEGA 一行改成 CH4。
+    pkt.move.vx = rcAxisToWire(rc_channels[RcMap::VX],
+                               RcMoveCfg::FULL_TRANSLATE_RPS,
+                               RcMap::VX_SIGN);
+    pkt.move.vy = rcAxisToWire(rc_channels[RcMap::VY],
+                               RcMoveCfg::FULL_TRANSLATE_RPS,
+                               RcMap::VY_SIGN);
+    pkt.move.omega = rcAxisToWire(rc_channels[RcMap::OMEGA],
+                                  RcMoveCfg::FULL_OMEGA,
+                                  RcMap::OMEGA_SIGN);
 
     pkt.crc16 = 0;
     pkt.crc16 = SignalUtils::calculateCrc(reinterpret_cast<uint8_t *>(&pkt),
@@ -381,13 +574,17 @@ static ControlPacket rcToMovePacket() {
 }
 
 // ============================================================================
-// RC → Shoot ControlPacket（測試：CH2 同時驅動上/下射兩顆無刷）
+// RC → Shoot ControlPacket
 //
-// CH2 (rc_channels[1]) 原始值 -100~100 直接填入 shoot.upSpeed / downSpeed，
-// 由 Shoot 端測試程式自行映射為 0~100% 出力（-97→0, +97→100）。
-// pitch / row 固定 0 — 本階段不驅動步進馬達。
+// 依 AGENTS 通道表：CH3→upSpeed、CH5→downSpeed、CH7→pitch、CH8→row。
+//   ⚠ 舊版把 CH2（前後移動）同時灌進 up/down 兩顆無刷：推前進時發射馬達
+//     也跟著轉，瞬間大電流造成電壓下陷 → 四輪出力不一致 → 直走會偏。
+//     Shoot 端再把 -100~100 映射為 0~100%（-97→0, +97→100）。
 // ============================================================================
-static constexpr bool RC_FORWARD_SHOOT = true; // false = 回到只轉發 Move
+// 遙控備援時是否同時轉發 Shoot。測試直走時請保持 false —— 舊版把 CH2
+// （前後移動）灌進發射馬達，推/拉油門會讓兩顆無刷全速，瞬間大電流
+// 造成電壓下陷，四輪出力不一致 → 直走會偏。
+static constexpr bool RC_FORWARD_SHOOT = false;
 
 static ControlPacket rcToShootPacket() {
     ControlPacket pkt = {};
@@ -397,11 +594,14 @@ static ControlPacket rcToShootPacket() {
     pkt.targetID = TargetID::SHOOT;
     pkt.payloadLen = sizeof(ControlPacket) - 6 - 2;
 
-    const int8_t ch2 = rcToInt8(rc_channels[1]); // CH2 → -100~100
-    pkt.shoot.upSpeed = ch2;
-    pkt.shoot.downSpeed = ch2;
-    pkt.shoot.pitch = 0;
-    pkt.shoot.row = 0;
+    // 無刷只有單向（1500us=停、2000us=全速），負值在 Shoot 端會被取絕對值
+    // 變成全速，因此這裡把負值夾成 0，避免開關在 -97 時馬達狂轉。
+    const int8_t up = rcToInt8(rc_channels[2]);   // CH3
+    const int8_t down = rcToInt8(rc_channels[4]); // CH5
+    pkt.shoot.upSpeed = up > 0 ? up : 0;
+    pkt.shoot.downSpeed = down > 0 ? down : 0;
+    pkt.shoot.pitch = rcToInt8(rc_channels[6]);   // CH7
+    pkt.shoot.row = rcToInt8(rc_channels[7]);     // CH8
 
     pkt.crc16 = 0;
     pkt.crc16 = SignalUtils::calculateCrc(reinterpret_cast<uint8_t *>(&pkt),
@@ -418,6 +618,8 @@ static ControlPacket rcToShootPacket() {
 // ============================================================================
 static void onJetsonFrame(const ControlPacket &pkt) {
     lastJetsonFrameUs = time_us_64();
+    if(jetsonFrameCount < UINT32_MAX)
+        jetsonFrameCount++;
 
     switch(pkt.targetID) {
     case TargetID::MOVE:
@@ -485,8 +687,9 @@ static void tryRcFallback() {
         uint64_t nowShoot = time_us_64();
         if(nowShoot - lastShootDbgUs > 1000000ULL) {
             lastShootDbgUs = nowShoot;
-            Serial.printf("[HUB] → Shoot up=%d down=%d (CH2=%d)\n",
-                          sh.shoot.upSpeed, sh.shoot.downSpeed, rc_channels[1]);
+            Serial.printf("[HUB] → Shoot up=%d down=%d (CH3=%d CH5=%d)\n",
+                          sh.shoot.upSpeed, sh.shoot.downSpeed,
+                          rc_channels[2], rc_channels[4]);
         }
     }
 
@@ -497,9 +700,11 @@ static void tryRcFallback() {
     if(nowPkt - lastPktDbgUs > 1000000ULL) {
         lastPktDbgUs = nowPkt;
         const uint8_t *pr = reinterpret_cast<const uint8_t *>(&mv);
-        Serial.printf("[HUB] chan1=%d chan0=%d chan7=%d | mv.vx=%d mv.vy=%d "
+        Serial.printf("[HUB] CH%d=%d CH%d=%d CH%d=%d | mv.vx=%d mv.vy=%d "
                       "mv.omega=%d | byte6,7,8=%02X %02X %02X\n",
-                      rc_channels[1], rc_channels[0], rc_channels[7],
+                      RcMap::VX + 1, rc_channels[RcMap::VX],
+                      RcMap::VY + 1, rc_channels[RcMap::VY],
+                      RcMap::OMEGA + 1, rc_channels[RcMap::OMEGA],
                       mv.move.vx, mv.move.vy, mv.move.omega, pr[6], pr[7],
                       pr[8]);
     }
@@ -539,6 +744,10 @@ void setup() {
 
     // 初始化 Jetson 逾時追蹤
     lastJetsonFrameUs = time_us_64();
+
+    // 狀態 LED
+    pinMode(LED_BUILTIN, OUTPUT);
+    digitalWrite(LED_BUILTIN, LOW);
 }
 
 // ============================================================================
@@ -551,6 +760,9 @@ void setup() {
 // ============================================================================
 void loop() {
     jetsonComms.update();
+
+    // 狀態 LED（與 Move Slave 相同邏輯：E-Stop 長亮、通訊中快閃、Idle 慢閃）
+    updateStatusLed();
 
     // 輪詢各 PIO UART RX，接收 Slave 回傳的 COBS 遙測幀
     processPioRx(moveUart, moveRxBuf, "Move", latestMoveTm, lastMoveTmUs);
@@ -571,6 +783,9 @@ void loop() {
     static uint64_t lastDbgUs = 0;
     if(now - lastDbgUs > 500000ULL) {
         lastDbgUs = now;
+        Serial.printf("[HUB] led=%s jetsonFrames=%lu\n",
+                      ledStateName(static_cast<LedState>(dbg_ledState)),
+                      static_cast<unsigned long>(jetsonFrameCount));
         if(rc_failsafe) {
             Serial.println("[HUB] RC FAILSAFE → 送 E-STOP 到 Move");
         } else {
@@ -583,8 +798,15 @@ void loop() {
                 "ch7=%d ch8=%d ch9=%d\n",
                 ch[0], ch[1], ch[2], ch[3], ch[4], ch[5], ch[6], ch[7], ch[8],
                 ch[9]);
-            Serial.printf("[HUB] → vx=%d vy=%d omega=%d\n", rcToInt8(ch[1]),
-                          rcToInt8(ch[0]), rcToInt8(ch[7]));
+            Serial.printf(
+                "[HUB] → vx=%d vy=%d omega=%d（CH%d/CH%d/CH%d）\n",
+                rcAxisToWire(ch[RcMap::VX], RcMoveCfg::FULL_TRANSLATE_RPS,
+                             RcMap::VX_SIGN),
+                rcAxisToWire(ch[RcMap::VY], RcMoveCfg::FULL_TRANSLATE_RPS,
+                             RcMap::VY_SIGN),
+                rcAxisToWire(ch[RcMap::OMEGA], RcMoveCfg::FULL_OMEGA,
+                             RcMap::OMEGA_SIGN),
+                RcMap::VX + 1, RcMap::VY + 1, RcMap::OMEGA + 1);
         }
     }
 

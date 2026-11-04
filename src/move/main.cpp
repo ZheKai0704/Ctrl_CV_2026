@@ -35,14 +35,16 @@
 namespace Pin {
 // 硬體 UART0 — 與 Hub 通訊（SlaveComms 內部處理 TX=GP0, RX=GP1）
 
-// PWM + DIR for 4 wheels（新板實測：FL 7/6, FR 9/8, BL 13/12, BR 10/11）
+// PWM + DIR for 4 wheels（新板實測：FL 7/6, FR 9/8, BL 13/12, BR 11/10）
 //   注意：新板的 DIR 與 PWM 腳位與舊板互換（舊板 FR 是 PWM=6/DIR=7）。
+//   BR 曾經把 PWM/DIR 寫反而造成「duty 越大轉越慢」（DIR 收到 20kHz PWM，
+//   馬達看到的是 |50%-duty| 的淨電壓）。已由 w br 5/10/15/25/40 掃描確認。
 constexpr uint MOTOR_FR_PWM = 9;
 constexpr uint MOTOR_FR_DIR = 8;
 constexpr uint MOTOR_FL_PWM = 7;
 constexpr uint MOTOR_FL_DIR = 6;
-constexpr uint MOTOR_BR_PWM = 10;
-constexpr uint MOTOR_BR_DIR = 11;
+constexpr uint MOTOR_BR_PWM = 11;
+constexpr uint MOTOR_BR_DIR = 10;
 constexpr uint MOTOR_BL_PWM = 13;
 constexpr uint MOTOR_BL_DIR = 12;
 
@@ -68,6 +70,12 @@ constexpr float WHEEL_RADIUS = 0.05f;
 // 編碼器
 constexpr uint16_t ENC_LINE_PPR = 443;                    // 實測線數
 constexpr uint16_t ENC_COUNTS_PER_REV = ENC_LINE_PPR * 4; // 4X → 1772
+// 每輪實際計數/圈（4X）。目前四輪實測同型（probe 相對比例差 ±2%），
+// 全部沿用 1772；若日後換到不同線數的編碼器，個別填入實測值即可。
+// 量法：move_drive_test 的 `enc` 手轉「剛好一圈」讀 raw Δ，或 `cpr`。
+static constexpr uint16_t kEncCountsPerRev[4] = {
+    ENC_COUNTS_PER_REV, ENC_COUNTS_PER_REV,
+    ENC_COUNTS_PER_REV, ENC_COUNTS_PER_REV}; // [FL, FR, BL, BR]
 
 // 閉迴路 PID 出力上限（duty%）。
 //   目前為全開 100%：「命令+ → 馬達最多 100%」。
@@ -113,12 +121,13 @@ constexpr float SCURVE_SETTLE_TOL = 0.010f;    // 到位判定 (RPS)
 
 // ============================================================================
 // 線上自適應 FF（RLS）— 方案 A 參數
-//   取代固定 pid.ff：FF = a*targetRps[i] + b。其中 (a, b) 由逐輪遞迴最小
-//   平方法（Recursive Least Squares, 遺忘因子 λ）持續線上更新，模型自動
-//   適應「目前電池電壓 + 目前地板摩擦」，無需電壓感測器。
+//   取代固定 pid.ff：FF = a*targetRps[i]。a 由逐輪遞迴最小平方法
+//   (Recursive Least Squares, 遺忘因子 λ) 持續線上更新，模型自動適應
+//   「目前電池電壓」，無需電壓感測器。
 //
-//   模型形式（每輪）：duty ≈ θ·φ = a*rps + b（rps 為輪轉速）
-//      a = 增益倒數（duty%/RPS），b = 庫倫摩擦截距（duty%）。
+//   模型形式（每輪）：duty ≈ a*rps（rps 為輪轉速，單一參數）
+//      a = 增益倒數（duty%/RPS）。
+//   （原本的 b 截距在等速時與 a 共線、無法辨識，會亂飄導致前饋失準，已移除。）
 //   訓練樣本：(measRps, outDuty)——僅當「追蹤穩定 + 實際移動 + 未飽和」
 //   時採樣，讓 RLS 把殘差收斂成真正的「duty→轉速」逆增益 + 摩擦。
 //
@@ -139,18 +148,17 @@ constexpr float MIN_SPEED_RPS = 0.02f;
 constexpr float SETTLE_TOL_RPS = 0.05f;
 // 增益 / 截距物理界限（duty%，防模型越界）。
 constexpr float A_MIN = 0.0f;
-constexpr float A_MAX = 30.0f;
+constexpr float A_MAX = 80.0f;
 constexpr float B_MIN = -15.0f;
 constexpr float B_MAX = 15.0f;
 } // namespace RlsCfg
 
 // 每輪 RLS 狀態（靜態分配；[FL, FR, BL, BR]）。
 struct RlsState {
-    float a = 15.0f; // 增益（初始 ≈ 原 pid.ff，開機後由 setup 以 kPidCfg 覆寫）
-    float b = 0.0f;  // 庫倫截距
-    // 2×2 協方差矩陣（僅需追蹤對稱元素）
-    float P00 = RlsCfg::P_INIT;
-    float P01 = 0.0f;
+    float a = 33.0f; // 增益 duty%/RPS（開機由 setup 以 kPidCfg.ff 覆寫）
+    float b = 0.0f;  // 保留欄位，單一參數模型下恆為 0
+    float P00 = RlsCfg::P_INIT; // 純量 RLS 協方差
+    float P01 = 0.0f; // 保留欄位（不再使用）
     float P11 = RlsCfg::P_INIT;
 };
 static RlsState rls[4];
@@ -164,19 +172,22 @@ struct WheelPidCfg {
     float kP, kI, kD, ff;
 };
 static const WheelPidCfg kPidCfg[4] = {
-    {2.40f, 10.4f, 0.0f, 15.2f}, // FL
-    {2.11f, 8.80f, 0.0f, 15.0f}, // FR
-    {2.09f, 8.70f, 0.0f, 14.8f}, // BL
-    {2.40f, 10.4f, 0.0f, 15.2f}, // BR
+    {2.40f, 10.4f, 0.0f, 33.0f}, // FL
+    {2.11f, 8.80f, 0.0f, 33.0f}, // FR
+    {2.09f, 8.70f, 0.0f, 33.0f}, // BL
+    {2.40f, 10.4f, 0.0f, 33.0f}, // BR
 };
 
 // 每輪極性（新板 move_dir_test 實測），輪序 = [FL, FR, BL, BR]。
 //   麥克納姆前進時運動學得到 FL=+, FR=-, BL=-, BR=+（左右鏡像），本表再
 //   依實際馬達安裝方向修正，使 fwd 時四輪物理上都往車頭。
 static const int8_t kWheelPolarity[4] = {1, 1, -1, -1};
-// 編碼器讀取極性（move_dir_test `cal` 實測）：
+// 編碼器讀取極性（move_dir_test `cal` / move_drive_test `probe` 實測）：
 //   讓「韌體命令 + → 回授 +」四輪一致，形成自洽閉環。
-static const int8_t kEncReadPolarity[4] = {1, -1, -1, -1};
+//   ⚠ BR 舊值 -1：修正 BR PWM/DIR 腳位後馬達正轉方向反了，
+//     命令 + 但回授為 -（正回饋，積分反向風扇）。probe 的 OL 15% 實測
+//     四輪應同號 → BR 改為 +1（move_dir_test 的 cal 可重新量測）。
+static const int8_t kEncReadPolarity[4] = {1, -1, +1, +1};
 
 // 車身兩條平移軸（vx = 左右 strafe、vy = 前後 forward）各自獨立方向開關。
 //   依實測車身方向微調，每條軸獨立 +1/-1，互不干擾 ω（旋轉）。
@@ -287,7 +298,11 @@ static const int8_t kQuadTable[4][4] = {
 // drain FIFO：把 PIO 推進來的相位取樣，逐一累計 to enc[]（套極性）。
 //   每輪最多 MAX_DRAIN 筆即停，避免無限追尾卡死。Core 1 控制週期呼叫。
 static void drainEncoders() {
-    constexpr int MAX_DRAIN = 64;
+    // 上限拉高：PIO 只在相位「變化」時 push，高速時每控制週期可能上百筆。
+    // 真正的防護是 setIdleHook(drainEncoders)：讓 Core 1 在 spinloop 中
+    // 持續吸血，避免 4~8 深的 RX FIFO 溢出掉計數（掉計數 → RPS 低估
+    // → PID 狂輸出 → 車子一衝一衝不順）。
+    constexpr int MAX_DRAIN = 512;
     for(int i = 0; i < 4; i++) {
         int n = 0;
         while(!pio_sm_is_rx_fifo_empty(g_pio, i) && n < MAX_DRAIN) {
@@ -313,14 +328,20 @@ static void encoderInit() {
         gpio_set_dir(bPin, GPIO_IN);
         gpio_pull_up(aPin);
         gpio_pull_up(bPin);
+        gpio_set_input_hysteresis_enabled(aPin, true); // 抗 PWM 耦合/擦振
+        gpio_set_input_hysteresis_enabled(bPin, true);
         pio_gpio_init(g_pio, aPin);
         pio_gpio_init(g_pio, bPin);
 
         pio_sm_config c = quad_phase_program_get_default_config(g_pioOffset);
         sm_config_set_in_pins(&c, aPin);              // base pin = A
         sm_config_set_in_shift(&c, false, false, 32); // left shift（關鍵）
-        sm_config_set_fifo_join(&c, PIO_FIFO_JOIN_NONE);
-        sm_config_set_clkdiv(&c, 5000.0f); // ~25kHz，濾回彈
+        sm_config_set_fifo_join(&c, PIO_FIFO_JOIN_RX); // 只用 RX → 8 筆緩衝
+        // 取樣率：150MHz / 500 = 300kHz SM clock，loop 約 5 指令
+        //   → 約 60kHz 取樣。原本 clkdiv=5000 只有約 6kHz，在 1 RPS 以上
+        //   就開始漏正交相位（1772 counts/rev；7 RPS ≈ 12.4k transitions/s），
+        //   造成轉速低估 → PID 飽和 → 起步/行進抽搐。
+        sm_config_set_clkdiv(&c, 500.0f);
 
         pio_sm_init(g_pio, i, g_pioOffset, &c);
         pio_sm_clear_fifos(g_pio, i);
@@ -359,6 +380,15 @@ static volatile float dbg_omega = 0.0f;
 static volatile uint32_t dbg_cmdCount = 0; // Core 1 實際執行 onCommand 的次數
 static volatile float dbg_measRps = 0.0f;  // FL(輪0) 量測轉速
 static volatile float dbg_outDuty0 = 0.0f; // FL(輪0) 實際輸出 duty%
+static uint8_t tmFrameSeq = 0;             // 遙測幀序號（Core 1 遞增）
+
+// 本 core 的 printf / Serial.printf 不支援 %f（會印成空白），
+// 因此序列監控一律用 ×100 整數輸出（vx/vy/omega/RPS = x0.01）。
+static int scaled100(float v) {
+    if(!std::isfinite(v))
+        return 0;
+    return static_cast<int>(v * 100.0f);
+}
 
 // 對 clamped float 值做上下限（靜態函式，無動態分配）。
 static float clampf(float v, float lo, float hi) {
@@ -369,39 +399,30 @@ static float clampf(float v, float lo, float hi) {
     return v;
 }
 
-// RLS 更新：餵入一筆 (rps, duty)，應用到指定輪的 (a, b)。
-//   φ = [rps, 1]ᵀ，θ = [a, b]ᵀ
-//   僅在 onMoveCommand 中、訓練門檻通過時呼叫。
+// RLS 更新：餵入一筆 (rps, duty)，更新單一增益 a（b 固定 0）。
+//   原本用 2 參數 (a, b) 模型 duty ≈ a*rps + b：等速時 φ=[rps,1] 幾乎共線，
+//   (a,b) 無法辨識，會沿 null 方向亂飄（實測 a 在 0~30、b 在 ±15 間跳動），
+//   前饋因此失準，閉迴路長期追不到目標。改成單一增益模型後可辨識且穩定。
 static void rlsUpdate(RlsState &s, float rps, float duty) {
-    // 預測誤差
-    const float pred = s.a * rps + s.b;
+    if(fabsf(rps) < RlsCfg::MIN_SPEED_RPS)
+        return;
+    s.b = 0.0f;
+    const float pred = s.a * rps;
     const float err = duty - pred;
 
-    // K = P·φ / (λ + φᵀ·P·φ)
-    const float Pphi0 = s.P00 * rps + s.P01; // (P·φ)0 = P00*rps + P01
-    const float Pphi1 = s.P01 * rps + s.P11; // (P·φ)1 = P10*rps + P11 (=P01*rps+P11)
-    const float denom = RlsCfg::LAMBDA + rps * Pphi0 + Pphi1;
-    if(denom < 1e-6f) // 數值退化防護
+    // 純量 RLS：K = P*rps / (λ + rps²*P)
+    const float Pphi = s.P00 * rps;
+    const float denom = RlsCfg::LAMBDA + rps * Pphi;
+    if(fabsf(denom) < 1e-6f) // 數值退化防護
         return;
-    const float K0 = Pphi0 / denom;
-    const float K1 = Pphi1 / denom;
+    const float K = Pphi / denom;
 
-    // θ += K·err
-    s.a += K0 * err;
-    s.b += K1 * err;
-
-    // P = (P - K·φᵀ·P) / λ；對稱化 + 上下限防炸
-    const float nP00 = (s.P00 - K0 * Pphi0) / RlsCfg::LAMBDA;
-    const float nP01 = (s.P01 - K0 * Pphi1) / RlsCfg::LAMBDA;
-    const float nP10 = (s.P01 - K1 * Pphi0) / RlsCfg::LAMBDA;
-    const float nP11 = (s.P11 - K1 * Pphi1) / RlsCfg::LAMBDA;
-    s.P00 = clampf(nP00, RlsCfg::P_MIN, RlsCfg::P_MAX);
-    s.P11 = clampf(nP11, RlsCfg::P_MIN, RlsCfg::P_MAX);
-    s.P01 = clampf((nP01 + nP10) * 0.5f, -RlsCfg::P_MAX, RlsCfg::P_MAX);
-
-    // 增益/截距物理界限
+    s.a += K * err;
+    s.P00 = clampf((s.P00 - K * Pphi) / RlsCfg::LAMBDA, RlsCfg::P_MIN,
+                   RlsCfg::P_MAX);
+    s.P01 = 0.0f; // 2×2 結構保留但不再使用
+    s.P11 = RlsCfg::P_MIN;
     s.a = clampf(s.a, RlsCfg::A_MIN, RlsCfg::A_MAX);
-    s.b = clampf(s.b, RlsCfg::B_MIN, RlsCfg::B_MAX);
 }
 
 // ============================================================================
@@ -564,7 +585,7 @@ static void onMoveCommand(const ChassisSnapshot &cmd) {
         // 低通量測轉速（含方向；enc 已統一符號 → 正目標對正量測）。
         //   單筆差分超過物理上限 → 視為編碼器突波，保留上次量測值。
         const float rawRps = static_cast<float>(d) /
-                             static_cast<float>(MoveCfg::ENC_COUNTS_PER_REV) / dt;
+                             static_cast<float>(MoveCfg::kEncCountsPerRev[i]) / dt;
         if(fabsf(rawRps) <= MoveCfg::WHEEL_MAX_RPS)
             w.measRps += alpha * (rawRps - w.measRps);
 
@@ -663,6 +684,16 @@ static void onMoveCommand(const ChassisSnapshot &cmd) {
     tm.mode = (uint8_t)RobotMode::AUTO;
     tm.estopFlag = 0;
     tm.timestamp = (uint32_t)(nowUs & 0xFFFFFFFFULL);
+    // ⚠ 遙測標頭 + CRC 必須填寫，否則 Hub 端 CRC 驗證失敗會整包丟棄
+    //   （序列監控會一直印 "CRC mismatch"，Move 的狀態完全看不到）。
+    //   注意：CRC 計算範圍不含 crc16 自身。
+    tm.sync = 0xA5;
+    tm.msgType = MsgType::TELEMETRY;
+    tm.frameSeq = tmFrameSeq++;
+    tm.targetID = TargetID::HUB;
+    tm.crc16 = 0;
+    tm.crc16 = SignalUtils::calculateCrc(
+        reinterpret_cast<const uint8_t *>(&tm), sizeof(MoveTelemetry) - 2);
     slave.prepareTelemetry(tm);
 }
 
@@ -816,6 +847,10 @@ void setup() {
 
     slave.begin();
 
+    // Core 1 空閒時持續 drain 編碼器 FIFO（見 drainEncoders 說明）。
+    // 只在沒有新命令 / 非 E-Stop 的 spinloop 中執行，不阻塞控制週期。
+    slave.setIdleHook(drainEncoders);
+
     Serial.println("[MOVE] FF = 線上 RLS 自適應（a*rps + b），初始 a=pid.ff，λ=0.995");
 }
 
@@ -829,8 +864,14 @@ void loop() {
         lastPrint = nowCfg;
         uint32_t since = slave.msSinceLastValidCmd();
         uint32_t cnt = slave.validCmdCount();
-        Serial.printf("[MOVE] sinceCmd=%ums cnt=%u onCmd=%u led=%s\n", since, cnt,
-                      dbg_cmdCount,
+        // RX 診斷：rx/crcErr 是「Hub→Move 這條線到底有沒有資料」。
+        //   rx 不增加、crcErr 一直增加 → 接線/鮑率/對端 CRC 問題。
+        //   rx 有增加但 cnt 不動 → 收到別台 targetID 或 msgType 不是 CONTROL。
+        Serial.printf("[MOVE] rx=%u crcErr=%u cmd=%u since=%ums\n",
+                      slave.rxFrameCount(), slave.rxCrcErrorCount(), cnt, since);
+        Serial.printf("[MOVE] lastRx type=%u id=%u seq=%u onCmd=%u led=%s\n",
+                      slave.lastRxMsgType(), slave.lastRxTargetID(),
+                      slave.lastRxFrameSeq(), dbg_cmdCount,
                       ledStateName(static_cast<LedState>(dbg_ledState)));
         if(slave.isEstopActive()) {
             // E-Stop 來源：逾時（沒收到資料）或 Hub 明確下令
@@ -839,21 +880,24 @@ void loop() {
             Serial.printf("[MOVE] ** E-STOP active (%s) **\n",
                           timeoutDriven ? "cmd timeout, no data" : "hub estop");
         } else {
-            Serial.printf("[MOVE] vx=%+.2f vy=%+.2f omega=%+.2f | "
-                          "FL meas=%+.2fRPS out=%+.0f%%\n",
-                          dbg_vx, dbg_vy, dbg_omega, dbg_measRps, dbg_outDuty0);
-            Serial.printf("       FR meas=%+.2f out=%+.0f | "
-                          "BL meas=%+.2f out=%+.0f | "
-                          "BR meas=%+.2f out=%+.0f\n",
-                          wheels[1].measRps, wheels[1].outDuty,
-                          wheels[2].measRps, wheels[2].outDuty,
-                          wheels[3].measRps, wheels[3].outDuty);
+            Serial.printf("[MOVE] vx=%+d vy=%+d omega=%+d x0.01\n",
+                          scaled100(dbg_vx), scaled100(dbg_vy),
+                          scaled100(dbg_omega));
+            Serial.printf("[MOVE] FL=%+d/%+d FR=%+d/%+d x0.01,%%\n",
+                          scaled100(wheels[0].measRps),
+                          static_cast<int>(wheels[0].outDuty),
+                          scaled100(wheels[1].measRps),
+                          static_cast<int>(wheels[1].outDuty));
+            Serial.printf("[MOVE] BL=%+d/%+d BR=%+d/%+d x0.01,%%\n",
+                          scaled100(wheels[2].measRps),
+                          static_cast<int>(wheels[2].outDuty),
+                          scaled100(wheels[3].measRps),
+                          static_cast<int>(wheels[3].outDuty));
             // 方案 A：RLS 自適應 FF 係數（觀察學習狀態）
             //   a = 增益(duty%/RPS)，b = 庫倫摩擦截距(duty%)
-            Serial.printf("       RLS a=[%.2f %.2f %.2f %.2f] "
-                          "b=[%+.2f %+.2f %+.2f %+.2f]\n",
-                          rls[0].a, rls[1].a, rls[2].a, rls[3].a,
-                          rls[0].b, rls[1].b, rls[2].b, rls[3].b);
+            Serial.printf("[MOVE] RLS a=[%d %d %d %d] x0.01\n",
+                          scaled100(rls[0].a), scaled100(rls[1].a),
+                          scaled100(rls[2].a), scaled100(rls[3].a));
         }
     }
 }

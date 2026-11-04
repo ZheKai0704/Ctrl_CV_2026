@@ -64,6 +64,16 @@ class ChassisComms {
     using FrameCallback = void (*)(const ControlPacket &pkt);
     void setFrameCallback(FrameCallback cb) { frameCb = cb; }
 
+    // ---- RX 診斷（給 Slave 端序列監控用）----
+    /// 通過 CRC 並送入 processFrame 的幀數（含重複/非本機 targetID）
+    uint32_t rxFrameCount() const { return rxFrameCount_; }
+    /// CRC 驗證失敗的幀數（接線/鮑率/對端未戳 CRC 時會持續增加）
+    uint32_t rxCrcErrorCount() const { return rxCrcErrorCount_; }
+    /// 最後一個通過 CRC 的幀的 msgType / targetID / frameSeq
+    uint8_t lastRxMsgType() const { return lastMsgType_; }
+    uint8_t lastRxTargetID() const { return lastTargetID_; }
+    uint8_t lastRxFrameSeq() const { return lastFrameSeq_; }
+
     /// 發送 ControlPacket（COBS 編碼 + CRC 戳記 + 寫入 Stream）
     /// 非阻塞：若 Stream 有剩餘 TX 空間則寫入，否則靜默丟棄
     /// @return true = 已寫入, false = 已丟棄
@@ -92,4 +102,14 @@ class ChassisComms {
     // 心跳
     uint64_t lastHeartbeatTime = 0;
     uint8_t txFrameSeq = 0;
+
+    // 遙測幀序號（sendTelemetry 內部戳記）
+    uint8_t telemetrySeq = 0;
+
+    // RX 診斷計數
+    uint32_t rxFrameCount_ = 0;
+    uint32_t rxCrcErrorCount_ = 0;
+    uint8_t lastMsgType_ = 0;
+    uint8_t lastTargetID_ = 0;
+    uint8_t lastFrameSeq_ = 0;
 };

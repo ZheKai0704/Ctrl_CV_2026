@@ -401,7 +401,7 @@ UART0 @ 420000 baud
 - UART0 映射: TX: GP0, RX: GP1 (與 Hub 通訊)
 - 馬達驅動型式: 硬體 PWM + DIR (非 PIO PWM)
 - 四輪腳位（依 `src/move/main.cpp` `Pin` namespace 實測驗證結果）:
-  **FR(PWM:GP6, DIR:GP7), FL(PWM:GP9, DIR:GP8), BR(PWM:GP10, DIR:GP11), BL(PWM:GP12, DIR:GP13)**
+  **FR(DIR:GP8, PWM:GP9), FL(DIR:GP6, PWM:GP7), BL(DIR:GP12, PWM:GP13), BR(DIR:GP10, PWM:GP11)**
 - 四輪編碼器 PIO 腳位（依實際實測驗證）:
   FR(A:GP14, B:GP15), FL(A:GP16, B:GP17), BR(A:GP20, B:GP21), BL(A:GP18, B:GP19)
 - PIO 資源: PIO0 全部 4 SM 做 Encoder，PIO1 未使用
