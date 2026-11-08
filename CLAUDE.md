@@ -368,24 +368,35 @@ UART0 @ 420000 baud
 
 ### RC 通道分配
 
-| 通道 | 變數 | 用途 | 目標 Slave |
-|------|------|------|-----------|
-| CH1 (Roll) | rc_channels[0] | vx（左右平移） | Move |
-| CH2 (Pitch) | rc_channels[1] | vy（前後移動） | Move |
-| CH3 (Throttle) | rc_channels[2] | upSpeed（上射速度） | Shoot |
-| CH4 (Yaw) | rc_channels[3] | omega（旋轉） | Move |
-| CH5 | rc_channels[4] | downSpeed（下射速度） | Shoot |
-| CH7 | rc_channels[6] | pitch（俯仰） | Shoot |
-| CH8 | rc_channels[7] | row（旋轉） | Shoot |
-| CH9 | rc_channels[8] | motorChannel（PCA9685 通道 0~15） | Storage |
-| CH10 | rc_channels[9] | trigger（0/1） | Storage |
+> 統一用語：RC 通道一律寫成 `rc[N]`，`N = 0~9`（0-based，程式碼中就是 `rc_channels[N]`）。
+> 文件與程式都不再使用「遙控器 CHx」這種 1-based 說法，避免差一位。
+
+| 通道 | 用途 | 目標 Slave |
+|------|------|-----------|
+| `rc[0]` | vx（左右平移） | Move |
+| `rc[1]` | vy（前後移動） | Move |
+| `rc[2]` | pitch（上下仰角 -97~97） | Shoot |
+| `rc[3]` | row（左右水平 -97~97） | Shoot |
+| `rc[4]` | 投射輪啟停：< 0 → 開（轉速固定 50%），≥ 0 → 0（停轉） | Shoot |
+| `rc[5]` | 控制來源切換：< -10 → 遙控接管全部 Slave；其餘 → Jetson 持有全部控制權（遙控器只讀本開關） | Hub |
+| `rc[6]` | 上下射轉速微調：< -10 → +5%、> +10 → -5%（上下同時）<br>⚠ 同時也是 Move 的 omega | Shoot / Move |
+| `rc[7]` | —（保留） | — |
+| `rc[8]` | trigger：< 0 → 全部伺服跑一次循環 | Storage |
+| `rc[9]` | 保留（Storage 本版未使用） | Storage |
 
 ### 備援邏輯
 
-1. Jetson 正常發送 → Core 0 直接轉發至 Slaves（自動模式）
-2. Jetson 逾時（>500ms）→ Core 0 改用 Core 1 的 RC 數據（備援）
-3. RC 也斷線（Failsafe）→ 發送 E-Stop 廣播至所有 Slaves
+1. Jetson 正常發送 → **JETSON 模式**：Jetson 持有全部控制權
+   （所有 Slave 命令與通道值都只來自 Jetson；遙控器只讀 `rc[5]` 切換開關）
+2. Jetson 逾時（>500ms）→ **RC_FALLBACK**：改用 Core 1 的 RC 數據（備援）
+3. RC 也斷線（Failsafe）且 Jetson 也逾時 → 發送 E-Stop 廣播至所有 Slaves
 4. 死區濾波：-10~10 → 0，避免微小抖動
+5. 控制來源切換：`rc[5]` < -10 → **RC_SWITCH**（遙控接管全部 Slave），
+   即使 Jetson 仍在送幀也一律走 RC 路徑（`onJetsonFrame` 直接丟棄命令，只更新時間戳）。
+   遙控 Failsafe 時不看 `rc[5]`，自動退回 Jetson；來源每圈只評估一次（`ControlSource`）。
+6. `RC_FORWARD_SHOOT=true`：RC 備援時同時轉發 Shoot（`rc[2]`→仰角、
+   `rc[3]`→水平、`rc[4]` 開關→投射輪開/關）。
+   投射輪開啟時轉速固定 50%，再用 `rc[6]` 每次 ±5% 微調。
 
 ---
 

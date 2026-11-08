@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """機構動作測試自動驗證（搭配 mechanism_test 固件）
 
-固件行為：HOME(30°) → 逐顆 CH0→CH15 → 每顆 OUT(120°) 停 1 秒 → 回 HOME(30°)
+固件行為：依觸發順序逐組；每組先逐顆 30°→120°→30° 驗證，
+再把整組開到 120° 並保持（做完的組不再回 HOME，`q` 才全部回 HOME）
 
 本腳本只做「驗證」，不改變機構邏輯：
   - 讀取 `l` / `p` 確認校正與啟用狀態
@@ -17,8 +18,8 @@
   # 真正跑一次完整循環並驗證
   ~/.platformio/penv/bin/python tools/mechanism_test.py --run
 
-  # 只測第 0 組（CH0/CH1）
-  ~/.platformio/penv/bin/python tools/mechanism_test.py --run --group 0
+  # 只測第 2 組（CH4/CH5，觸發順序的第一組）
+  ~/.platformio/penv/bin/python tools/mechanism_test.py --run --group 2
 
   # 改角度與時間後再跑
   ~/.platformio/penv/bin/python tools/mechanism_test.py --run --home 30 --out 120 --dwell 1000 --settle 500
@@ -167,51 +168,93 @@ class Report:
         return 1 if failed else 0
 
 
+# 與固件一致：觸發順序（src/storage/main.cpp SeqCfg::GROUP_ORDER）
+GROUP_ORDER = [2, 5, 1, 6, 0, 7]
+
+
+def group_channel_order():
+    """完整循環的組順序：先 GROUP_ORDER，再補上順序表外的組。"""
+    order = list(GROUP_ORDER)
+    order += [g for g in range(8) if g not in GROUP_ORDER]
+    return order
+
+
 def expected_steps(cfg, group):
     """回傳預期的通道順序（已啟用且符合群組）。"""
     if group is not None:
-        cand = [group * 2, group * 2 + 1]
+        groups = [group]
     else:
-        cand = list(range(16))
+        groups = group_channel_order()
+    cand = []
+    for g in groups:
+        cand += [g * 2, g * 2 + 1]
     return [ch for ch in cand if cfg.get(ch, {}).get("enabled")]
 
 
 def analyse(lines, steps, home, out, dwell_ms, settle_ms, tol_ms=400):
-    """回傳 (events, problems)。events = [(t, ch, angle)]"""
+    """回傳 (events, problems)。events = [(t, ch, angle, kind)]
+
+    固件每組做兩段：
+      a) 逐顆驗證：CH → OUT → HOME（kind = 'out' / 'home'）
+      b) 整組開啟：CH → OUT 並保持（kind = 'open'，行尾帶「（開啟）」）
+    驗證順序 / 角度 / 停留時間是否符合預期。
+    """
     events = []
     problems = []
-    pat = re.compile(r"\[SEQ\] CH(\d+) → ([\d.]+)°")
+    pat_out = re.compile(r"\[SEQ\] CH(\d+) → ([\d.]+)°(.*)$")
     for t, line in lines:
-        m = pat.search(line)
-        if m:
-            events.append((t, int(m.group(1)), float(m.group(2))))
+        m = pat_out.search(line)
+        if not m:
+            continue
+        kind = "open" if "開啟" in m.group(3) else None
+        ch = int(m.group(1))
+        deg = float(m.group(2))
+        if kind is None:
+            kind = "out" if abs(deg - out) <= 0.6 else "home"
+        events.append((t, ch, deg, kind))
+
+    # 每組一顆一顆驗證完，再把整組開到 OUT
+    groups = []
+    for ch in steps:
+        if groups and groups[-1][0] == ch // 2:
+            groups[-1][1].append(ch)
+        else:
+            groups.append((ch // 2, [ch]))
 
     expected = []
-    for ch in steps:
-        expected.append((ch, out))
-        expected.append((ch, home))
+    for _g, chs in groups:
+        for ch in chs:
+            expected.append((ch, out, "out"))
+            expected.append((ch, home, "home"))
+        for ch in chs:
+            expected.append((ch, out, "open"))
 
     if len(events) != len(expected):
         problems.append(f"事件數 {len(events)}，預期 {len(expected)}")
     else:
-        for i, ((t, ch, deg), (ech, edeg)) in enumerate(zip(events, expected)):
-            if ch != ech or abs(deg - edeg) > 0.6:
+        for i, ((t, ch, deg, kind), (ech, edeg, ekind)) in enumerate(
+                zip(events, expected)):
+            if ch != ech or kind != ekind or abs(deg - edeg) > 0.6:
                 problems.append(
-                    f"第 {i + 1} 個動作 CH{ch} {deg}°，預期 CH{ech} {edeg}°")
+                    f"第 {i + 1} 個事件 CH{ch} {kind} {deg}°，"
+                    f"預期 CH{ech} {ekind} {edeg}°")
 
-    # 時間驗證
-    for i in range(0, len(events) - 1, 2):  # out -> home
-        if i + 1 < len(events):
-            dt = (events[i + 1][0] - events[i][0]) * 1000
+    # 時間：out → home ≈ dwell；home → 下一個事件 ≈ settle，
+    # 但同一組的「驗證結束 → 整組開啟」與「開啟 → 下一顆開啟」不檢查
+    for i in range(len(events) - 1):
+        t, ch, _deg, kind = events[i]
+        nt, nch, _ndeg, nkind = events[i + 1]
+        dt = (nt - t) * 1000
+        if kind == "out" and nkind == "home":
             if abs(dt - dwell_ms) > tol_ms:
-                problems.append(
-                    f"CH{events[i][1]} 停留 {dt:.0f}ms，預期 {dwell_ms}ms")
-    for i in range(1, len(events) - 1, 2):  # home -> next out
-        dt = (events[i + 1][0] - events[i][0]) * 1000
-        if abs(dt - settle_ms) > tol_ms:
+                problems.append(f"CH{ch} 停留 {dt:.0f}ms，預期 {dwell_ms}ms")
+        elif kind == "home" and nkind == "open":
+            continue
+        elif kind == "open":
+            continue
+        elif abs(dt - settle_ms) > tol_ms:
             problems.append(
-                f"CH{events[i][1]}→CH{events[i + 1][1]} 間隔 {dt:.0f}ms，"
-                f"預期 {settle_ms}ms")
+                f"CH{ch}→CH{nch} 間隔 {dt:.0f}ms，預期 {settle_ms}ms")
     return events, problems
 
 
@@ -285,8 +328,8 @@ def main():
         else:
             cmd = "s"
 
-        # 預估總時間：每顆 dwell + settle，加上通訊餘量
-        total_s = len(steps) * (dwell + settle) / 1000.0 + 5.0
+        # 預估總時間：每顆 dwell + settle，換組再多一次 settle，加通訊餘量
+        total_s = len(steps) * (dwell + settle) / 1000.0 + 8 * settle / 1000.0 + 5.0
         print(f"\n=== 執行 {cmd}（預估 {total_s:.0f}s）===")
         dev.ser.reset_input_buffer()
         dev.ser.write((cmd + "\n").encode())
@@ -304,10 +347,11 @@ def main():
         if events:
             print("\n=== 實際動作 ===")
             t0 = events[0][0]
-            for t, ch, deg in events:
-                print(f"  +{(t - t0) * 1000:7.0f} ms  CH{ch:<2} → {deg:5.1f}°")
+            for t, ch, deg, kind in events:
+                tag = {"out": "OUT ", "home": "HOME", "open": "開啟"}[kind]
+                print(f"  +{(t - t0) * 1000:7.0f} ms  CH{ch:<2} {tag} {deg:5.1f}°")
 
-        # 收尾：確認回到 HOME
+        # 收尾：確認已停止（各組維持 OUT，不自動回 HOME）
         status2 = parse_status(dev)
         report.add("結束後回到閒置", "閒置" in status2["raw"],
                    status2["raw"].splitlines()[-1] if status2["raw"] else "")

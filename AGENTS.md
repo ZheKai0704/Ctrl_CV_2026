@@ -368,25 +368,33 @@ UART0 @ 420000 baud
 
 ### RC 通道分配
 
-| 通道 | 變數 | 用途 | 目標 Slave |
-|------|------|------|-----------|
-| ch0（CH1） | rc_channels[0] | vy（前後移動） | Move |
-| ch1（CH2） | rc_channels[1] | vx（左右平移） | Move |
-| ch2（CH3） | rc_channels[2] | pitch（上下仰角 -97~97） | Shoot |
-| ch3（CH4） | rc_channels[3] | row（左右水平 -97~97） | Shoot |
-| ch4（CH5） | rc_channels[4] | upSpeed/downSpeed：< 0 → 30%，≥ 0 → 0 | Shoot |
-| ch7（CH8） | rc_channels[7] | omega（cw/ccw 旋轉） | Move |
-| ch7（CH8） | rc_channels[7] | trigger：< 0 → 全部伺服跑一次循環 | Storage |
-| ch8 / ch9 | rc_channels[8/9] | 保留（Storage 本版未使用） | Storage |
+> 統一用語：RC 通道一律寫成 `rc[N]`，`N = 0~9`（0-based，程式碼中就是 `rc_channels[N]`）。
+> 文件與程式都不再使用「遙控器 CHx」這種 1-based 說法，避免差一位。
 
-> ⚠ `ch7`（= `rc_channels[7]` = EdgeTX CH8）同時被 Move 的 omega 與 Storage 的
-> trigger 使用。只接單一節點測試時沒問題；兩者同時上線請改其中一個
-> （Hub 端 `RcMap::OMEGA` 或 `RcMap::STORAGE_TRIGGER`，改一行即可）。
+| 通道 | 用途 | 目標 Slave |
+|------|------|-----------|
+| `rc[0]` | vx（左右平移） | Move |
+| `rc[1]` | vy（前後移動） | Move |
+| `rc[2]` | pitch（上下仰角 -97~97） | Shoot |
+| `rc[3]` | row（左右水平 -97~97） | Shoot |
+| `rc[4]` | 投射輪啟停：< 0 → 開（轉速固定 50%），≥ 0 → 0（停轉） | Shoot |
+| `rc[5]` | 控制來源切換：< -10 → 遙控接管全部 Slave；其餘 → Jetson 持有全部控制權（遙控器只讀本開關） | Hub |
+| `rc[6]` | 上下射轉速微調：< -10 → +5%、> +10 → -5%（上下同時）<br>⚠ 同時也是 Move 的 omega | Shoot / Move |
+| `rc[7]` | —（保留） | — |
+| `rc[8]` | trigger：< 0 → 全部伺服跑一次循環 | Storage |
+| `rc[9]` | 保留（Storage 本版未使用） | Storage |
+
+> Move 的 omega 與 Storage 的 trigger 已分開：omega 與上下射轉速微調共用 **`rc[6]`**、storage trigger = **`rc[8]`**。
 
 > Hub 端 `src/hub/main.cpp` 的 `RcMap` 集中管理通道與方向：
-> `VX=0 (CH1)`、`VY=1 (CH2)`、`OMEGA=7 (CH8)`；
+> `RcMap::VX=0`、`RcMap::VY=1`、`RcMap::OMEGA=6`、`RcMap::SHOOT_ENABLE=4`、
+> `RcMap::SOURCE_SELECT=5`、`RcMap::SHOOT_SPEED=6`、`RcMap::STORAGE_TRIGGER=8`
+> （數值就是 `rc[N]` 的 N）；
 > **方向（實機實測）：`VX_SIGN=-1`、`VY_SIGN=+1`、`OMEGA_SIGN=-1`。**
-> 若旋轉改到 CH4，把 `OMEGA` 改成 `3` 即可。
+>
+> 上下射轉速（`RcShootCfg`）：基準固定 `BASE_PCT=50`%，`rc[6]` 每觸發一次
+> 微調 `STEP_PCT=5`%（微調量 ±50，等效 0~100%）——方向邊緣觸發；
+> 若要「按住連續微調」把 `HOLD_REPEAT_MS` 設成 > 0（例如 250）。上下兩顆永遠同值。
 >
 > Move 速度刻度（`RcMoveCfg`）：`FULL_TRANSLATE_RPS=1.20`、`FULL_OMEGA=7.00`；
 > 死區 ±10 後重新映射 0~100，避免過死區時跳動。
@@ -394,12 +402,21 @@ UART0 @ 420000 baud
 
 ### 備援邏輯
 
-1. Jetson 正常發送 → Core 0 直接轉發至 Slaves（自動模式）
-2. Jetson 逾時（>500ms）→ Core 0 改用 Core 1 的 RC 數據（備援），約 100Hz
-3. RC 也斷線（Failsafe）→ 發送 E-Stop 廣播至所有 Slaves
+1. Jetson 正常發送 → **JETSON 模式**：Jetson 持有全部控制權
+   （Move / Shoot / Storage 所有命令、所有通道值都只來自 Jetson；遙控器只讀 `rc[5]`，
+   其他 rc 通道一律不參與，連 RC Failsafe 也不會因此送 E-Stop）
+2. Jetson 逾時（>500ms）→ **RC_FALLBACK**：改用 Core 1 的 RC 數據（備援），約 100Hz
+3. RC 也斷線（Failsafe）且 Jetson 也逾時 → 發送 E-Stop 廣播至所有 Slaves
 4. 死區濾波：-10~10 → 0，避免微小抖動
-5. `RC_FORWARD_SHOOT=false`：RC 備援時不同時轉發 Shoot，避免推油門時
-   發射無刷一起全速造成電流下陷、四輪出力不一致（直走會偏）
+5. 控制來源切換：`rc[5]` < -10 → **RC_SWITCH**（遙控接管全部 Slave），
+   即使 Jetson 仍在送幀也一律走 RC 路徑（`onJetsonFrame` 直接丟棄命令，只更新時間戳）。
+   遙控本身 Failsafe 時不看 `rc[5]`（讀不到），自動退回 Jetson，不會鎖死在遙控模式。
+   控制來源每圈 `loop()` 只評估一次（`ControlSource`），Jetson 轉發與 RC 轉發
+   只看同一個值，不會出現兩邊同時送命令。
+6. `RC_FORWARD_SHOOT=true`：RC 備援時同時轉發 Shoot（`rc[2]`→仰角、
+   `rc[3]`→水平、`rc[4]` 開關→投射輪開/關）。
+   投射輪開啟時轉速固定 50%，再用 `rc[6]` 每次 ±5% 微調；
+   不隨油門全速，避免瞬間大電流造成電壓下陷、四輪出力不一致（直走會偏）
 
 ---
 
@@ -437,15 +454,18 @@ UART0 @ 420000 baud
 
 ### 4. Storage Slave 節點腳位與參數
 - UART0: TX: GP0, RX: GP1 (與 Hub 通訊)
-- PCA9685: I2C1 (SDA:GP2, SCL:GP3), 預設位址 0x40, 50Hz
+- PCA9685: I2C0 (SDA:GP4, SCL:GP5), 預設位址 0x40, 50Hz（與 mechanism_test 相同腳位）
 - PCA9685 通道 0~15 伺服馬達（實際啟用哪幾顆由 EEPROM 校正決定）
-- **只有伺服馬達**：trigger 步進馬達（GP4/5/6）已移除
+- **只有伺服馬達**：trigger 步進馬達已移除（GP6 未使用；GP4/GP5 現在是 I2C）
 - 通道校正（min/max μs、實體角度範圍、反向、啟用）沿用 EEPROM，格式與
   `pca9685_angle` / `test/mechanism` 相同（MAGIC `PCA4`），無設定時預設
   16 通道全啟用、600~2400μs、0~180°、正向
-- 動作：`trigger` 上緣（Hub 端 ch7 < 0）→ 全部已啟用通道依序做
-  OUT(120°) → 停留 1s → HOME(30°) → 等 0.5s，跑完一輪就停；E-Stop 或
-  trigger 放開 → 全部回 HOME。
+- 動作：`trigger` **每上緣一次做一個動作**，等下一次 trigger；
+  順序 `g2×5 → g5×5 → g1×5 → g6×5 → g0×5 → g7×5`（共 30 次，組 n = CH(2n)、CH(2n+1)）；
+  每個動作 = 組內每顆已啟用通道 `OUT(120°) → 停留 1s → HOME(30°) → 等 0.5s`；
+  **每組的第 5 次（最後一輪）**驗證完後，整組一起開到 `OUT(120°)` 並維持開啟（不回 HOME），
+  先前已開啟的組也會一直保持；下一次完整循環（回到第 1 動）開始前才全部回 HOME。
+  全部 30 次做完後，下一次 trigger 從 g2 重新開始；E-Stop 會全部歸 HOME 並歸零序列。
 - `StoragePayload.motorChannel` / `.sw` 目前保留未使用
 
 ### 5. Ultrasonic 節點

@@ -44,10 +44,10 @@ Hub Core 0 同時負責 USB CDC 收發、PIO UART 對所有 Slave 的 TX/RX；Co
 
 | 方向 | 馬達 PWM | 馬達 DIR | 編碼器 A | 編碼器 B |
 |------|----------|----------|----------|----------|
-| **FR**（前右） | GP6 | GP7 | GP14 | GP15 |
-| **FL**（前左） | GP9 | GP8 | GP16 | GP17 |
-| **BR**（後右） | GP10 | GP11 | GP20 | GP21 |
-| **BL**（後左） | GP12 | GP13 | GP18 | GP19 |
+| **FR**（前右） | GP9 | GP8 | GP14 | GP15 |
+| **FL**（前左） | GP7 | GP6 | GP16 | GP17 |
+| **BR**（後右） | GP11 | GP10 | GP20 | GP21 |
+| **BL**（後左） | GP13 | GP12 | GP18 | GP19 |
 
 ### 其他腳位 / 參數
 
@@ -61,9 +61,9 @@ Hub Core 0 同時負責 USB CDC 收發、PIO UART 對所有 Slave 的 TX/RX；Co
 | 實測線數 `ENC_LINE_PPR` | 443 |
 | `ENC_COUNTS_PER_REV` | 443 × 4 = 1772 |
 | 車身半長/半寬/輪半徑 (m) | 0.25 / 0.25 / 0.05 |
-| 馬達極性 `kWheelPolarity[]` | `{1,-1,1,-1}`（FR/BR 反相） |
-| 編碼器讀取極性 `kEncReadPolarity[]` | `{1,-1,1,-1}`（FR/BR 鏡像） |
-| Strafe 軸方向 | `kAxisStrafePolarity = +1` |
+| 馬達極性 `kWheelPolarity[]` | `{1,1,-1,-1}`（輪序 FL/FR/BL/BR，BL/BR 反相） |
+| 編碼器讀取極性 `kEncReadPolarity[]` | `{1,-1,+1,+1}`（輪序 FL/FR/BL/BR） |
+| Strafe 軸方向 | `kAxisStrafePolarity = -1` |
 | Forward 軸方向 | `kAxisForwardPolarity = -1` |
 | 三軸 S 曲線加速 / 減速 | 4.0 / 12.0 RPS/s |
 | 三軸 Jerk | 60.0 RPS/s² |
@@ -73,44 +73,60 @@ Hub Core 0 同時負責 USB CDC 收發、PIO UART 對所有 Slave 的 TX/RX；Co
 
 ---
 
-## Shoot Slave 腳位設定（上射/下射 BLDC + 俯仰/橫向步進）
+## Shoot Slave 腳位設定（仰角 UART 步進 + 水平 STEP/DIR 步進 + 三顆 BLDC）
 
 依 `src/shoot/main.cpp` `Pin` namespace：
 
 | 功能 | 腳位 |
 |------|------|
 | 通訊 UART0 TX / RX | GP0 / GP1 |
-| UP 上射 BLDC（PWM） | GP2 |
-| DOWN 下射 BLDC（PWM） | GP3 |
-| FIXED 固定轉速 BLDC（PWM） | GP4 |
-| PITCH 俯仰 步進 STEP | GP5 |
-| PITCH 俯仰 步進 DIR | GP6 |
-| ROW 橫向 步進 STEP | GP7 |
-| ROW 橫向 步進 DIR | GP8 |
-| STEPPER_ENABLE（低電位致能） | GP9 |
+| 仰角 步進 UART TX（`ELEV_UART_TX` → 驅動器 RX） | GP2 |
+| 仰角 步進 UART RX（`ELEV_UART_RX` ← 驅動器 TX） | GP3 |
+| UP 上射 BLDC（PWM） | GP4 |
+| DOWN 下射 BLDC（PWM） | GP5 |
+| ROW 水平 步進 STEP | GP6 |
+| ROW 水平 步進 DIR | GP7 |
+| ROW 水平 步進 ENA（低電位致能） | GP8 |
+| FIXED 固定轉速 BLDC（PWM） | GP9 |
 
-- 無刷馬達為 50Hz servo-style PPM：**1500μs = 中立/停止，2000μs = 全速**
-- FIXED 固定轉速無刷脈衝 `PULSE_FIXED` = 1750μs
-- 步進馬達：1.8°/step，全步進
+- **仰角 (pitch)**：UART 閉環步進驅動器（ZDT X42S / Emm 固件），PIO 模擬 UART（SerialPIO）115200 baud；3200 脈衝/圈（1.8° × 16 細分）、600 RPM、加速度檔 100；上電自動清零建立零位
+- **水平 (row)**：傳統 STEP/DIR 驅動器（A4988 / DRV8825 / TB6600），STEP 由 PIO 產生；1.8°/step 全步進（200 step/rev）、最高速 600 step/s、加速度 4000 step/s²、DIR 建立時間 20µs
+- 兩軸輸入限幅 ±97 → ±90°
+- **無刷馬達**：50Hz servo-style PPM：**1500μs = 中立/停止，2000μs = 全速**；FIXED 固定轉速脈衝 `PULSE_FIXED` = 1750μs（可用 `Pin::kEnableBldc` 停用）
+- upSpeed/downSpeed 為永久性速度設定（EEPROM 持久化，每次開機自動恢復）
+- **PIO 資源**：PIO0 — 仰角 UART（SerialPIO）+ 水平 STEP 脈衝；PIO1 — 三顆 BLDC 50Hz 伺服脈衝（需 `pio_set_gpio_base(pio1, 0)`）
 
 ---
 
-## Storage Slave 腳位設定（PCA9685 伺服 + Trigger 步進馬達）
+## Storage Slave 腳位設定（PCA9685 伺服）
 
-依 `src/storage/main.cpp` `Pin` namespace：
+依 `src/storage/main.cpp` `Pin` namespace（與 `mechanism_test` 相同）：
 
 | 功能 | 介面 / 腳位 |
 |------|-------------|
 | 通訊 UART0 TX / RX | GP0 / GP1 |
-| PCA9685 I2C1 SDA | GP2 |
-| PCA9685 I2C1 SCL | GP3 |
-| Trigger 步進 STEP | GP4 |
-| Trigger 步進 DIR | GP5 |
-| STEPPER_ENABLE（低電位致能） | GP6 |
+| PCA9685 I2C0 SDA | GP4 |
+| PCA9685 I2C0 SCL | GP5 |
 
-- **PCA9685**：I2C1（SDA=GP2, SCL=GP3），預設位址 `0x40`；**通道 0~9 連接 10 顆伺服馬達**
-- Trigger 步進馬達驅動：A4988 / DRV8825，預設正轉方向
-- 伺服脈衝範圍：500~2500μs（每通道可個別設定關閉/開啟位置）
+- **PCA9685**：I2C0（SDA=GP4, SCL=GP5），預設位址 `0x40`；通道 0~15（實際啟用哪幾顆由 EEPROM 決定）
+- 伺服脈衝範圍：600~2400μs（每通道可個別設定）
+
+---
+
+## Ultrasonic 節點腳位設定（獨立 Pico，8× US-100）
+
+依 `src/ultrasonic/main.cpp`：GPIO Trigger/Echo 模式，PIO 量測 Echo 脈衝寬度，USB Serial 輸出。
+
+| 感測器 | Trigger | Echo |
+|--------|---------|------|
+| FRONT_LEFT | GP2 | GP3 |
+| FRONT_RIGHT | GP4 | GP5 |
+| BACK_LEFT | GP6 | GP7 |
+| BACK_RIGHT | GP8 | GP9 |
+| LEFT_1（前） | GP10 | GP11 |
+| LEFT_2（後） | GP12 | GP13 |
+| RIGHT_1（前） | GP14 | GP15 |
+| RIGHT_2（後） | GP16 | GP17 |
 
 ---
 
@@ -118,15 +134,21 @@ Hub Core 0 同時負責 USB CDC 收發、PIO UART 對所有 Slave 的 TX/RX；Co
 
 Hub Core 1 以 420000 baud 接收遙控訊號，Jetson 斷線（>500ms）時作為控制備援。通道值域 **-100 ~ 100**，`rcToInt8()` 套用死區（-10~10 → 0）。
 
-| 遙控通道 | `rc_channels[]` | 參數 | 對應動作 | 目標 Slave |
-|----------|-----------------|------|----------|-----------|
-| CH1 (Roll) | `[0]` | `vy` | 左右平移 | Move |
-| CH2 (Pitch) | `[1]` | `vx` | 前後移動 | Move |
-| CH3 (Throttle) | `[2]` | `upSpeed` | 上射速度 | Shoot |
-| CH4 (Yaw) | `[3]` | `omega` | 旋轉 | Move |
-| CH5 | `[4]` | `downSpeed` | 下射速度 | Shoot |
-| CH6 | `[5]` | — | - | — |
-| CH7 | `[6]` | `pitch` | 俯仰（±100 → ±90°） | Shoot |
-| CH8 | `[7]` | `row` | 橫向旋轉（±100 → ±90°） | Shoot |
-| CH9 | `[8]` | `motorChannel` | PCA9685 通道 0~15 | Storage |
-| CH10 | `[9]` | `trigger` | 觸發開關（> 50 視為 1） | Storage |
+> 統一用語：RC 通道一律寫成 `rc[N]`，`N = 0~9`（0-based，程式碼中就是 `rc_channels[N]`）。
+> 文件與程式都不再使用「遙控器 CHx」這種 1-based 說法，避免差一位。
+
+| 通道 | 參數 | 對應動作 | 目標 Slave |
+|------|------|----------|-----------|
+| `rc[0]` | `vx` | 左右平移（方向 `VX_SIGN=-1`） | Move |
+| `rc[1]` | `vy` | 前後移動（`VY_SIGN=+1`） | Move |
+| `rc[2]` | `pitch` | 上下仰角 | Shoot |
+| `rc[3]` | `row` | 左右水平 | Shoot |
+| `rc[4]` | `upSpeed` / `downSpeed` | 投射輪啟停：< 0 → 開（轉速固定 50%），≥ 0 → 0（停轉） | Shoot |
+| `rc[5]` | 控制來源 | < -10 → 遙控接管全部 Slave；其餘 → Jetson 持有全部控制權（遙控器只讀本開關） | Hub |
+| `rc[6]` | `omega` / 轉速微調 | 上下射轉速：< -10 → +5%、> +10 → -5%（上下兩顆同時）<br>⚠ 同時也是 Move 的 omega | Shoot / Move |
+| `rc[7]` | — | 保留 | — |
+| `rc[8]` | `trigger` | < 0 → 全部伺服跑一次循環 | Storage |
+| `rc[9]` | — | 保留（本版未使用） | — |
+
+> 上下射轉速 = 固定基準 `50%` + `rc[6]` 每次 `±5%` 微調（微調量 ±50，等效 0~100%），
+> 方向邊緣觸發；`RcShootCfg::HOLD_REPEAT_MS > 0` 可改成「按住連續微調」。

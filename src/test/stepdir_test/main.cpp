@@ -51,7 +51,7 @@ constexpr uint EN = 4;   // → 驅動器 ENA
 static PIO gPio = pio0;
 static uint gSm = 0;
 static uint gOffset = 0;
-constexpr uint gIrqFlag = 0;        // step_pulse.pio 到位時設定的 IRQ 旗標
+constexpr uint gIrqFlag = 0;           // step_pulse.pio 到位時設定的 IRQ 旗標
 constexpr float kCyclesPerStep = 7.0f; // set[3] = 4 + set[1] = 2 + jmp = 1
 static float gClkSysHz = 150000000.0f;
 
@@ -61,10 +61,10 @@ static float gClkSysHz = 150000000.0f;
 static bool gEnActiveLow = true;            // EN 低電位致能（多數 TB6600/DM542）
 static bool gDirInvert = false;             // DIR 方向反向
 static float gStepsPerRev = 200.0f * 16.0f; // 1.8° 步進 × 16 細分 = 3200
-static float gSpeedRpm = 120.0f;            // 目標轉速
+static float gSpeedRpm = 60.0f;             // 目標轉速
 static float gAccelSps2 = 50000.0f;         // 加速度 steps/s²（0 = 不加速）
 // 脈衝速率上下限由 PIO clock divider 決定：clk_sys / (7 × 1) ~ clk_sys / (7 × 65536)
-constexpr float kMinSps = 330.0f;   // ≈ 6 RPM @ 3200 步/圈（divider 上限）
+constexpr float kMinSps = 330.0f;    // ≈ 6 RPM @ 3200 步/圈（divider 上限）
 constexpr float kMaxSps = 150000.0f; // 軟體上限；再上去多數驅動器跟不上
 
 // ============================================================================
@@ -74,11 +74,11 @@ struct StepperState {
     bool running = false;
     bool continuous = false;
     bool enabled = false;
-    int32_t total = 0;       // 本次命令總步數（連續模式為 0）
-    float speedSps = 0.0f;   // 目前命令速率 steps/s
-    float targetSps = 0.0f;  // 目標速率 steps/s
-    float estSteps = 0.0f;   // 已發出步數估算（積分速率）
-    int8_t dir = 1;          // +1 正轉，-1 反轉
+    int32_t total = 0;      // 本次命令總步數（連續模式為 0）
+    float speedSps = 0.0f;  // 目前命令速率 steps/s
+    float targetSps = 0.0f; // 目標速率 steps/s
+    float estSteps = 0.0f;  // 已發出步數估算（積分速率）
+    int8_t dir = 1;         // +1 正轉，-1 反轉
     uint32_t lastRampUs = 0;
 };
 static StepperState gSt;

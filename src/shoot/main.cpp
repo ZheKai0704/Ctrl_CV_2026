@@ -16,12 +16,19 @@
 //   921600 baud, COBS 封幀 + CRC16
 //
 // 控制資料 (ShootPayload)：
-//   upSpeed    (int8) — 上輪無刷馬達轉速，永久性速度設定 (-100~100)
-//   downSpeed  (int8) — 下輪無刷馬達轉速，永久性速度設定 (-100~100)
+//   upSpeed    (int8) — 上輪無刷馬達轉速，永久性速度設定 (0~100)
+//   downSpeed  (int8) — 下輪無刷馬達轉速，永久性速度設定 (0~100)
 //   pitch      (int8) — 仰角位置 (-97~97) → UART 步進馬達
 //                        -97 = 最低角, 0 = 0°, +97 = 最高角
 //   row        (int8) — 水平位置 (-97~97) → STEP/DIR 步進馬達
 //                        -97 = 逆時針 90°, 0 = 0°, +97 = 順時針 90°
+//
+// ⚠ 轉速值由 Hub 決定「絕對值」，本節點只負責套用：
+//     * 遙控備援模式：Hub 固定基準 50%，再用 rc[6]（遙控器第 7 支撥桿）
+//       每次 ±5% 微調，上下兩顆永遠同一個值
+//     * Jetson 自駕模式：由 Jetson 直接指定 0~100
+//     * 0% = 1500µs 中立 = 停轉；50% ≈ 1750µs；100% = 2000µs 全速
+//     * 電調為單向，負值一律視為等量正轉（speedToPulse() 取 fabsf）
 //
 // 兩軸輸入一律限幅在 ±97（超過的部分忽略），用於保留機構行程餘裕。
 //
@@ -601,6 +608,18 @@ float getDownSpeed() { return persistentDownSpeed; }
 // 但 ESC 必須繼續收到 1500µs 中立訊號才不會亂轉，所以由 Core 0 持續補 FIFO。
 // 跨核心傳遞用 32-bit volatile（單一字組寫入即 atomic，不需鎖）。
 // ============================================================================
+// 單向電調的轉速正規化（BldcControl 與 onShootCommand 共用）：
+//   NaN → 0、負值取大小（電調單向）、上限 100
+static float sanitizeSpeed(float speed) {
+    if(std::isnan(speed))
+        return 0.0f;
+    if(speed < 0.0f)
+        speed = -speed;
+    if(speed > 100.0f)
+        speed = 100.0f;
+    return speed;
+}
+
 namespace BldcControl {
 constexpr uint32_t FRAME_US = 20000;   // 50Hz
 constexpr uint16_t PULSE_MID = 1500;   // 中立點/停止
@@ -686,7 +705,9 @@ void init() {
     }
 }
 
+// speed 0~100 → 1500~2000µs（0% 必須是 1500 中立，才會停轉）
 static uint16_t speedToPulse(float speed) {
+    speed = sanitizeSpeed(speed);
     if(speed == 0.0f)
         return PULSE_MID;
     float absSpd = fabsf(speed);
@@ -777,14 +798,19 @@ static void onShootCommand(const ChassisSnapshot &cmd) {
     dbg_cmdCount++;
     dbg_lastPitch = static_cast<int8_t>(lroundf(cmd.pitch));
     dbg_lastRow = static_cast<int8_t>(lroundf(cmd.row));
-    dbg_lastUp = static_cast<int8_t>(lroundf(cmd.shootUpSpeed));
-    dbg_lastDown = static_cast<int8_t>(lroundf(cmd.shootDownSpeed));
+
+    // 轉速：單向電調 → 正規化成 0~100（NaN/負值/超範圍都在這裡收乾）
+    const float upSpeed = sanitizeSpeed(cmd.shootUpSpeed);
+    const float downSpeed = sanitizeSpeed(cmd.shootDownSpeed);
+    dbg_lastUp = static_cast<int8_t>(lroundf(upSpeed));
+    dbg_lastDown = static_cast<int8_t>(lroundf(downSpeed));
 
     // 永久性速度：每次命令都储存並套用（包括速度=0 的清零指令）
-    SpeedStorage::saveUpSpeed(cmd.shootUpSpeed);
-    SpeedStorage::saveDownSpeed(cmd.shootDownSpeed);
-    BldcControl::setUpSpeed(cmd.shootUpSpeed);
-    BldcControl::setDownSpeed(cmd.shootDownSpeed);
+    // saveUpSpeed 內部會比較差異，值沒變就不會 EEPROM.commit()
+    SpeedStorage::saveUpSpeed(upSpeed);
+    SpeedStorage::saveDownSpeed(downSpeed);
+    BldcControl::setUpSpeed(upSpeed);
+    BldcControl::setDownSpeed(downSpeed);
 
     // 兩軸步進目標
     ElevStepper::setTarget(cmd.pitch); // 仰角：UART 閉環步進

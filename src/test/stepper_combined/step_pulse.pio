@@ -1,0 +1,31 @@
+; ============================================================================
+; step_pulse.pio — 步進馬達 STEP 脈衝產生器（RP2350 / RP2040）
+;
+; 每個脈衝固定 7 個 PIO 週期（不隨速度改變佔空比）：
+;   set pins,1 [3]   → STEP 高 4 週期（57%）
+;   set pins,0 [1]   → STEP 低 2 週期（29%）
+;   jmp x-- loop     → 1 週期（14%）
+;
+;   f_step = clk_sys / (7 × clkdiv)
+;   實測脈寬：60 kHz 時 高 9.5µs / 低 7.1µs（TB6600、DM542 皆遠高於 2.5µs 需求）
+;             150 kHz 時 高 3.8µs / 低 2.9µs（仍符合多數驅動器規格）
+;
+; CPU 介面：
+;   1. pio_sm_put(pio, sm, N)  → N = 本次要發的脈衝數（0xFFFFFFFF = 幾乎無限）
+;   2. 發完後 irq 4 旗標置位（走 PIO IRQ1，避免與 SerialPIO 的 IRQ0 衝突），
+;      CPU 以 pio_interrupt_get() 偵測到位
+;   3. 沒有新命令時停在 pull block，STEP 保持低電位
+;
+; 週期數總計：pull 0（僅命令間）+ 7 cycles/step
+; ============================================================================
+.program step_pulse
+start:
+    pull block                  ; 等待 CPU 給脈衝數（無資料時停在這裡，STEP 低）
+    mov x, osr                  ; X = 剩餘脈衝數
+    jmp !x start                ; N = 0 → 忽略，繼續等
+loop:
+    set pins, 1 [3]             ; STEP 高：4 cycles
+    set pins, 0 [1]             ; STEP 低：2 cycles
+    jmp x-- loop                ; 1 cycle，X 歸零後跳出
+    irq 4                       ; 到位：設 IRQ 旗標 4（PIO IRQ1）通知 CPU
+    jmp start                   ; 回到等待下一次命令

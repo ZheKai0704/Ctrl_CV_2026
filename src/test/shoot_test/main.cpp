@@ -2,11 +2,11 @@
 // shoot_test — Shoot Slave 上下射無刷馬達 RC 控制測試 (RP2350)
 //
 // 用途：
-//   驗證「RC CH2 → Hub → PIO UART GP4/GP5 → Shoot UART0 → 上下兩顆 BLDC」
-//   這條備援控制鏈路。本程式只驅動 UP/DOWN 兩顆無刷馬達，
-//   完全不碰俯仰/橫向步進馬達。
+//   驗證「rc[1] → Hub → PIO UART GP4/GP5 → Shoot UART0
+//   → 上下兩顆 BLDC」這條備援控制鏈路。本程式只驅動 UP/DOWN 兩顆無刷馬達，
+//   完全不碰仰角/水平步進馬達。
 //
-// 控制映射（收到的是 Hub 轉發的 CH2 原始值 -100~100）：
+// 控制映射（收到的是 Hub 轉發的 rc[1] 原始值 -100~100）：
 //     -97 以下 →   0%  (停止)
 //        0      →  50%
 //     +97 以上 → 100%  (全速)
@@ -16,7 +16,15 @@
 //    Hub PIO SM1 (GP4 TX, GP5 RX) ↔ Shoot UART0 (TX=GP0, RX=GP1)
 //    921600 baud, COBS 封幀 + CRC16
 //    Hub 端由 tryRcFallback() 的 rcToShootPacket() 發送：
-//    shoot.upSpeed = shoot.downSpeed = CH2
+//    shoot.upSpeed = shoot.downSpeed = rc[1] 原始值
+//
+// ⚠️ 本測試沿用「舊版 Hub 轉發行為 + 舊板腳位」，與現行主程式不同：
+//    - Hub：現行 src/hub/main.cpp 的 rcToShootPacket() 改由
+//      rc[4] 開關控制 upSpeed/downSpeed（< 0 → 開、固定 50% + rc[6] ±5% 微調，
+//      ≥ 0 → 0），不再轉發 rc[1] 原始值。
+//    - Shoot 硬體：現行 src/shoot/main.cpp 為 UP=GP4、DOWN=GP5、FIXED=GP9
+//      （本測試 UP=GP2、DOWN=GP3、STEPPER_ENABLE=GP9 為舊板腳位）。
+//    若要對現行 Hub / 新板測試，請先更新本檔的 Pin 與映射。
 //
 // 安全：
 //    - SlaveComms 逾時保護：>100ms 無有效控制幀 → E-Stop → 兩顆回 0%
@@ -62,9 +70,9 @@ constexpr uint16_t PWM_WRAP = 19999; // 20000 ticks = 20ms → 50Hz
 constexpr uint16_t PULSE_ZERO = 1500; // 0%（見檔頭慣例說明）
 constexpr uint16_t PULSE_FULL = 2000; // 100%
 
-// CH2 映射端點：-97 → 0%，+97 → 100%
-constexpr float CH2_MIN = -97.0f;
-constexpr float CH2_MAX = 97.0f;
+// rc_channels[] 輸入映射端點：-97 → 0%，+97 → 100%
+constexpr float RC_INPUT_MIN = -97.0f;
+constexpr float RC_INPUT_MAX = 97.0f;
 
 constexpr uint32_t ARM_DELAY_MS = 3000; // 上電後等待電調辨識解鎖
 } // namespace Esc
@@ -74,7 +82,7 @@ constexpr uint32_t ARM_DELAY_MS = 3000; // 上電後等待電調辨識解鎖
 // （Serial 綁定 Core 0，禁止在 Core 1 呼叫）
 // ============================================================================
 struct DebugState {
-    volatile int32_t ch2Raw;   // 收到的 CH2 原始值
+    volatile int32_t rcRaw;    // 收到的 rc[1] 原始值
     volatile int32_t pct;      // 映射後出力 %
     volatile int32_t pulseUs;  // 實際輸出脈寬
     volatile uint32_t rxCount; // 累計收到的有效控制幀數
@@ -101,12 +109,12 @@ static void applyPulse(uint16_t us) {
 }
 
 // ============================================================================
-// 映射：CH2 (-100~100) → 出力 % (0~100)
+// 映射：rc_channels[] 值 (-100~100) → 出力 % (0~100)
 //   線性斜率 = 100 / (97 - (-97)) = 0.5155 %/unit，超出範圍夾在 0/100
 // ============================================================================
-static int pctFromCh2(float ch2) {
-    constexpr float kSpan = Esc::CH2_MAX - Esc::CH2_MIN; // 194
-    float pct = (ch2 - Esc::CH2_MIN) * (100.0f / kSpan);
+static int pctFromRc(float rcVal) {
+    constexpr float kSpan = Esc::RC_INPUT_MAX - Esc::RC_INPUT_MIN; // 194
+    float pct = (rcVal - Esc::RC_INPUT_MIN) * (100.0f / kSpan);
     if(pct < 0.0f)
         pct = 0.0f;
     if(pct > 100.0f)
@@ -121,13 +129,13 @@ static uint16_t pctToPulse(int pct) {
                                  (pct * span) / 100);
 }
 
-/// 套用 CH2 → 兩顆無刷，並記錄除錯狀態（Core 1 context）
-static void applyCh2(float ch2) {
-    const int pct = pctFromCh2(ch2);
+/// 套用 rc_channels[] 輸入 → 兩顆無刷，並記錄除錯狀態（Core 1 context）
+static void applyRc(float rcVal) {
+    const int pct = pctFromRc(rcVal);
     const uint16_t us = pctToPulse(pct);
     applyPulse(us);
 
-    g_dbg.ch2Raw = static_cast<int32_t>(lroundf(ch2));
+    g_dbg.rcRaw = static_cast<int32_t>(lroundf(rcVal));
     g_dbg.pct = pct;
     g_dbg.pulseUs = us;
 }
@@ -136,8 +144,8 @@ static void applyCh2(float ch2) {
 // SlaveApp 回呼（Core 1 context，不可阻塞）
 // ============================================================================
 static void onShootCommand(const ChassisSnapshot &cmd) {
-    // Hub 把 CH2 原始值同時寫入 upSpeed / downSpeed
-    applyCh2(cmd.shootUpSpeed);
+    // Hub 把 rc[1] 原始值同時寫入 upSpeed / downSpeed
+    applyRc(cmd.shootUpSpeed);
     g_dbg.rxCount++;
     g_dbg.estop = 0;
 }
@@ -166,9 +174,9 @@ void setup() {
 
     Serial.println();
     Serial.println("========================================");
-    Serial.println("[shoot_test] Shoot 上下射無刷 — RC CH2 測試");
+    Serial.println("[shoot_test] Shoot 上下射無刷 — rc[1] 測試");
     Serial.println("========================================");
-    Serial.printf("  CH2 -97→0%% / 0→50%% / +97→100%%（夾在 0~100%%）\n");
+    Serial.printf("  rc[1] -97→0%% / 0→50%% / +97→100%%（夾在 0~100%%）\n");
     Serial.printf("  PWM: clkdiv=%u wrap=%u → 50Hz | 0%%=%uµs 100%%=%uµs\n",
                   static_cast<unsigned>(Esc::PWM_CLKDIV),
                   static_cast<unsigned>(Esc::PWM_WRAP),
@@ -193,15 +201,15 @@ void loop() {
         lastPrintUs = now;
 
         // 先快照 volatile 欄位，避免同一行讀到不一致的組合
-        const int32_t ch2 = g_dbg.ch2Raw;
+        const int32_t rcVal = g_dbg.rcRaw;
         const int32_t pct = g_dbg.pct;
         const int32_t us = g_dbg.pulseUs;
         const uint32_t rx = g_dbg.rxCount;
         const uint8_t estop = g_dbg.estop;
 
-        Serial.printf("[SHOOT_TEST] ch2=%4d → %3d%% (%4dµs) | rx=%u | "
+        Serial.printf("[SHOOT_TEST] rc_channels[1]=%4d → %3d%% (%4dµs) | rx=%u | "
                       "%s | silent=%ums\n",
-                      static_cast<int>(ch2), static_cast<int>(pct),
+                      static_cast<int>(rcVal), static_cast<int>(pct),
                       static_cast<int>(us), static_cast<unsigned>(rx),
                       estop ? "E-STOP" : "RUN   ",
                       static_cast<unsigned>(slave.msSinceLastValidCmd()));

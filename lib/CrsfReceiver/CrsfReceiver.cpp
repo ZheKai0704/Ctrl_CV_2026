@@ -170,7 +170,7 @@ void CrsfReceiver::decodeRcChannels(const uint8_t *payload,
     }
 }
 
-int16_t CrsfReceiver::normalizeChannel(uint16_t raw_val, uint8_t ch_idx) {
+int16_t CrsfReceiver::normalizeChannel(uint16_t raw_val, uint8_t idx) {
     int32_t val = raw_val;
     if(val < (RC_CENTER - RC_RANGE))
         val = RC_CENTER - RC_RANGE;
@@ -181,8 +181,8 @@ int16_t CrsfReceiver::normalizeChannel(uint16_t raw_val, uint8_t ch_idx) {
     // 適用所有通道（含 Throttle），讓每個遙桿在中立點都回傳 0。
     int16_t out = static_cast<int16_t>((val - RC_CENTER) * 100 / RC_RANGE);
 
-    // CH6 通道方向校正（遙控器特定設置，不影響中立點）
-    if(ch_idx == 6)
+    // rc[6] 方向校正（遙控器特定設置，不影響中立點）
+    if(idx == 6)
         out = -out;
     return out;
 }
@@ -215,8 +215,8 @@ void CrsfReceiver::update() {
         uint16_t raw_channels[16];
         decodeRcChannels(_frameBuf + 3, raw_channels);
 
-        for(uint8_t ch = 0; ch < 10; ch++) {
-            _finalChannels[ch] = normalizeChannel(raw_channels[ch], ch);
+        for(uint8_t idx = 0; idx < 10; idx++) {
+            _finalChannels[idx] = normalizeChannel(raw_channels[idx], idx);
         }
         digitalWrite(LED_BUILTIN, !digitalRead(LED_BUILTIN)); // 正常閃爍
     }
@@ -224,9 +224,9 @@ void CrsfReceiver::update() {
     // 檢查超時
     if(currentTime - _lastValidFrameTime > FAILSAFE_TIMEOUT_MS) {
         _isFailsafeActive = true;
-        for(int ch = 0; ch < 10; ch++)
-            _finalChannels[ch] = 0;
-        _finalChannels[4] = -100; // Failsafe 保護
+        for(int idx = 0; idx < 10; idx++)
+            _finalChannels[idx] = 0;
+        _finalChannels[4] = 0; // rc[4]：Failsafe 保護 → < 0 是「投射輪開」，所以強制歸 0（停轉）
 
         if(currentTime - _lastLedToggleTime >= 100) {
             _lastLedToggleTime = currentTime;

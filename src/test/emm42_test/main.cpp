@@ -69,9 +69,9 @@ constexpr uint16_t kPulsesPerRev = 3200;
 
 // 可調參數（預設值保守，避免超出馬達上限被回 E2 而看起來「不會動」）
 constexpr uint16_t kVelMinRpm = 1;
-constexpr uint16_t kVelMaxRpm = 3000; // Emm42_V5.0 / X42S 標稱上限
-static uint16_t gVelRpm = 600;        // 位置模式速度（RPM）
-static uint8_t gAccStep = 100;        // 加速度檔位 0-255（0 = 無加減速）
+constexpr uint16_t kVelMaxRpm = 25000; // Emm42_V5.0 / X42S 標稱上限
+static uint16_t gVelRpm = 9000;        // 位置模式速度（RPM）
+static uint8_t gAccStep = 200;         // 加速度檔位 0-255（0 = 無加減速）
 // FD 位置幀格式：true = 13B（第二代，含「運動模式」位元）；false = 12B（V4.2 舊 Emm）
 static bool gModeByte = true;
 
@@ -80,7 +80,10 @@ static bool gModeByte = true;
 // ============================================================================
 static uint8_t sTxBuf[32];
 static uint8_t sRxBuf[64];
-static uint8_t sTxLen = 0;
+static uint8_t sTxLen = 0;  // 目前 sTxBuf 的有效長度
+static uint8_t sLastTx[32]; // 上一幀送出的副本（回音偵測用）
+static uint8_t sLastTxLen = 0;
+static bool sEchoGuideShown = false; // 詳細回音說明只印一次
 
 // ============================================================================
 // 底層收發
@@ -97,6 +100,8 @@ static void printHex(const char *tag, const uint8_t *buf, uint8_t len) {
 }
 
 static void sendFrame(const uint8_t *buf, uint8_t len) {
+    memcpy(sLastTx, buf, len); // 留副本，接收端比對是否只是把自己的 TX 打回來
+    sLastTxLen = len;
     Serial1.write(buf, len);
     Serial1.flush(); // 等 TX 真的送完，避免半框被 RX / 下一命令打斷
     // 把送出的幀印出來：跟手冊逐位元組對照用
@@ -143,7 +148,38 @@ static const char *replyCodeText(uint8_t code) {
     }
 }
 
+// 收到的位元組是否只是自己剛送出的 TX 原封打回來（loopback / 回音）
+static uint8_t echoPrefixLen(uint8_t n) {
+    if(n == 0 || sLastTxLen == 0) {
+        return 0;
+    }
+    uint8_t cmp = (n < sLastTxLen) ? n : sLastTxLen;
+    if(cmp < 3) {
+        return 0;
+    }
+    return (memcmp(sRxBuf, sLastTx, cmp) == 0) ? cmp : 0;
+}
+
+// 偵測到回音時的判讀說明（詳細版只印一次，避免刷版）
+static void printEchoGuide() {
+    Serial.println("  ⚠ 這不是馬達回覆：收到的位元組與剛送出的 TX 完全相同 → 回音（loopback）");
+    if(sEchoGuideShown) {
+        return;
+    }
+    sEchoGuideShown = true;
+    Serial.println("    真正的使能回覆第 5 byte 應是 02（01 F3 AB 01 02 6B），不會是 00");
+    Serial.println("    常見原因：");
+    Serial.println("      1) GP0(TX) 與 GP1(RX) 短路，或兩條線接到馬達同一個腳位");
+    Serial.println("      2) 馬達端 T/B/L(TX) 與 R/A/H(RX) 被並接在一起");
+    Serial.println("      3) 中間有 RS485 / 半雙工轉板，本機 TX 直接回灌 RX");
+    Serial.println("    驗證：把馬達三條線全拔掉，再按一次 'e'");
+    Serial.println("      • 還是收到同樣 echo → 板子或線材自己 loopback，先修硬體");
+    Serial.println("      • 沒有 echo        → 回音來自馬達側接線，查 R/T 是否並接");
+    Serial.println("    另一種可能：馬達 P_Serial 不是 UART（被設成 RS485 / CAN 模式）");
+}
+
 // 印出回覆並嘗試解讀（位址 + 功能碼 + 回覆碼）
+//   只從「不是回音」的起點開始找，且跳過 func=00 / code=0x6B 這類明顯誤判
 static void printRawReply(uint8_t n) {
     if(n == 0) {
         Serial.println("  reply (0B): 無回應！檢查 TX/RX 是否對調、共地、波特率、"
@@ -151,12 +187,28 @@ static void printRawReply(uint8_t n) {
         return;
     }
     printHex("  reply", sRxBuf, n);
-    for(uint8_t i = 0; i + 2 < n; i++) {
+
+    const uint8_t echoLen = echoPrefixLen(n);
+    if(echoLen > 0) {
+        printEchoGuide();
+    }
+
+    bool decoded = false;
+    for(uint8_t i = echoLen; i + 2 < n; i++) {
         if(sRxBuf[i] != X42S::PROTO_ADDR) {
             continue;
         }
-        Serial.printf("  → addr=%u func=%02X : %s\n", sRxBuf[i], sRxBuf[i + 1],
-                      replyCodeText(sRxBuf[i + 2]));
+        const uint8_t func = sRxBuf[i + 1];
+        const uint8_t code = sRxBuf[i + 2];
+        if(func == 0x00 || code == X42S::TAIL) { // 同步標誌 / 尾碼，不是回覆碼
+            continue;
+        }
+        Serial.printf("  → addr=%u func=%02X 回覆碼=%02X : %s\n", sRxBuf[i], func, code,
+                      replyCodeText(code));
+        decoded = true;
+    }
+    if(!decoded && echoLen == 0) {
+        Serial.println("  → 無法辨識的回覆格式（非標準回覆碼，也不是單純回音）");
     }
 }
 
@@ -489,6 +541,11 @@ static void selfTest() {
     printRawReply(n);
     if(n == 0) {
         Serial.println("!! 使能就沒回覆 → 這是 UART/接線/波特率問題，不是角度命令問題。");
+        return;
+    }
+    if(echoPrefixLen(n) > 0) {
+        Serial.println("!! 只收到自己送出的回音 → 連線路都是 loopback，後面的角度測試沒有意義。");
+        Serial.println("   先解決 TX/RX 短路（見上方原因），再按 't' 重測。");
         return;
     }
 

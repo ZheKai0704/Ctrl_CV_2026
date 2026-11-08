@@ -1,13 +1,17 @@
 // ============================================================================
 // mechanism_test — 機構動作測試 (RP2350 + PCA9685)
 //
-// 行為（依序逐顆動作）：
+// 行為（依觸發順序逐組動作）：
 //   1. 開機 / 停止時：所有「已啟用」通道停在 HOME 角度（預設 30°）
-//   2. 按下啟動：
-//        CH0 → OUT(120°)，停留 1 秒 → 回 HOME(30°)，等 SETTLE(0.5s)
-//        CH1 → 120°，1 秒 → 30°，等 0.5s
-//        CH2 → ... 一直到 CH15
-//      全部做完 = 一個循環（可選擇重複）
+//   2. 按下啟動：依觸發順序 g2 → g5 → g1 → g6 → g0 → g7
+//      （組 n = CH(2n), CH(2n+1)；序列未列到的 g3、g4 排在最後）
+//      每一組做兩段：
+//        a) 逐顆驗證行程：CH(2n) 30° → 120° → 停 1 秒 → 30°
+//                         CH(2n+1) 30° → 120° → 停 1 秒 → 30°
+//        b) 整組開啟：CH(2n) → 120°、CH(2n+1) → 120° 並保持
+//      這組就維持開啟，等 SETTLE(0.5s) 再換下一組；後面的組同樣開啟並保持
+//      全部做完 = 一個循環（可選擇重複），結束時所有組都維持開啟，
+//      要回 HOME 必須按 `q`（或 `m` 重設角度）
 //   3. 通道分組（每 2 顆一組）：(0,1) (2,3) (4,5) ... (14,15)
 //      `g <n>` 只測第 n 組
 //
@@ -15,6 +19,8 @@
 //   - 角度使用「邏輯角度」，與 pca9685_angle 相同慣例；
 //     每通道的 0° 零點、行程、反向、實體工作範圍、啟用狀態
 //     都直接沿用 EEPROM 內的設定（與角度測試工具同一份，MAGIC=PCA4）。
+//   - 奇數通道（CH1/3/5/7/9/11/13/15）因機構左右對稱安裝，
+//     韌體強制反向（與 EEPROM invert 以 OR 合併，不會二次反向）。
 //   - 停用通道（目前 CH6~9）會自動跳過，不會被驅動。
 //   - 全程非阻塞狀態機，Serial 隨時可下命令。
 //
@@ -22,12 +28,12 @@
 //   GP4=SDA, GP5=SCL, PCA9685 VCC=3.3V, GND 共地, V+=伺服電源, OE 拉低
 //
 // Serial 命令（115200，※大小寫有別）：
-//   s            執行一次完整循環（CH0→CH15）
+//   s            執行一次完整循環（依觸發順序 g2→g5→g1→g6→g0→g7）
 //   S            重複執行完整循環（再按 S 或 q 停止）
 //   g <0~7>      只測第 n 組：(0,1)=0, (2,3)=1, ... (14,15)=7
 //   q            停止（所有通道回 HOME）
 //   m <home> <out>   設定角度（預設 30 120）
-//   t <dwellMs> <settleMs>  設定停留/回位等待（預設 1000 500）
+//   t <dwellMs> <settleMs>  設定停留 / 換組前等待（預設 1000 500）
 //   p            顯示狀態與設定
 //   l            列出各通道校正設定
 //   x            緊急關閉全部輸出
@@ -78,6 +84,9 @@ constexpr uint16_t DEFAULT_MAX_US = 2400;
 constexpr uint16_t ABS_MIN_US = 300;
 constexpr uint16_t ABS_MAX_US = 3000;
 constexpr uint16_t MIN_SPAN_US = 100;
+// 機構左右成對安裝，奇數通道（CH1/3/5/7/9/11/13/15）實體方向相反。
+// 這裡在硬體層強制反向，與 EEPROM 的 invert 採 OR 合併（不會二次反向）。
+constexpr bool MIRROR_ODD_CHANNELS = true;
 } // namespace Servo
 
 // ============================================================================
@@ -116,6 +125,15 @@ static uint32_t checksumOf(const Persist &p) {
     for(size_t i = 0; i < sizeof(Persist) - sizeof(uint32_t); i++)
         sum += raw[i];
     return sum;
+}
+
+// 實際是否反向：奇數通道硬體鏡像，或 EEPROM 校正指定反向
+static bool effectiveInvert(uint8_t ch) {
+    if(ch >= Pca::CHANNEL_COUNT)
+        return false;
+    if(Servo::MIRROR_ODD_CHANNELS && (ch & 1u))
+        return true;
+    return channels[ch].invert != 0;
 }
 
 static bool validPulse(uint16_t minUs, uint16_t maxUs) {
@@ -257,7 +275,8 @@ static float logicalToPhysical(uint8_t ch, float logicalDeg) {
         ch = 0;
     logicalDeg = clampAngle(logicalDeg);
     const ChannelLimit &l = Limits::channels[ch];
-    float phys = l.invert ? (Servo::ANGLE_MAX - logicalDeg) : logicalDeg;
+    float phys =
+        Limits::effectiveInvert(ch) ? (Servo::ANGLE_MAX - logicalDeg) : logicalDeg;
     if(phys < static_cast<float>(l.minDeg))
         phys = static_cast<float>(l.minDeg);
     if(phys > static_cast<float>(l.maxDeg))
@@ -268,7 +287,7 @@ static float logicalToPhysical(uint8_t ch, float logicalDeg) {
 static float physicalToLogical(uint8_t ch, float physDeg) {
     if(ch >= Pca::CHANNEL_COUNT)
         ch = 0;
-    if(Limits::channels[ch].invert)
+    if(Limits::effectiveInvert(ch))
         physDeg = Servo::ANGLE_MAX - physDeg;
     return clampAngle(physDeg);
 }
@@ -373,16 +392,37 @@ namespace Seq {
 static float homeDeg = 30.0f;
 static float outDeg = 120.0f;
 static uint32_t dwellMs = 1000;  // OUT 停留
-static uint32_t settleMs = 500;   // 回 HOME 後等它到位，再換下一顆
+static uint32_t settleMs = 500;   // 回 HOME 後/換組前的等待
+
+// 觸發順序（與 src/storage/main.cpp 的 SeqCfg::GROUP_ORDER 相同）：
+//   組 n = CH(2n), CH(2n+1) → g2 → g5 → g1 → g6 → g0 → g7
+// 完整循環（'s'）依此順序走；'g' 不帶參數時也依此順序換下一組。
+// 順序表未列到的組（g3、g4）排在最後，仍可用 'g 3' / 'g 4' 單獨測試。
+static constexpr uint8_t GROUP_ORDER[] = {2, 5, 1, 6, 0, 7};
+static constexpr uint8_t GROUP_ORDER_COUNT =
+    sizeof(GROUP_ORDER) / sizeof(GROUP_ORDER[0]);
+static constexpr uint8_t GROUP_COUNT = Pca::CHANNEL_COUNT / 2;
+static constexpr uint8_t GROUP_CHANNELS = 2;
 
 static bool running = false;
 static bool repeating = false;
 static uint8_t steps[Pca::CHANNEL_COUNT] = {0};
+static uint8_t stepGroup[Pca::CHANNEL_COUNT] = {0}; // 每個 step 所屬組別
 static uint8_t stepCount = 0;
-static uint8_t nextGroup = 0; // 'g' 不帶參數時使用，每次自動 +1
+static uint8_t nextGroup = GROUP_ORDER[0]; // 'g' 不帶參數時使用，依 GROUP_ORDER 換組
 static uint8_t stepIdx = 0;
 
-enum Phase : uint8_t { PHASE_NONE = 0, PHASE_OUT, PHASE_DWELL, PHASE_SETTLE };
+// 每一組的動作流程：
+//   [組內每顆] OUT → dwell → HOME → settle    ← 逐顆驗證行程
+//   然後 [整組] 全部 → OUT（開啟）並保持       ← 這組就維持開啟，不再回 HOME
+//   → 下一組
+enum Phase : uint8_t { PHASE_NONE = 0,
+                       PHASE_OUT,
+                       PHASE_DWELL,
+                       PHASE_HOME,
+                       PHASE_SETTLE,
+                       PHASE_OPEN,
+                       PHASE_GAP };
 static Phase phase = PHASE_NONE;
 static uint32_t phaseMs = 0;
 static uint32_t cycleStartMs = 0;
@@ -398,22 +438,47 @@ static void goHomeAll() {
 
 static void stop(); // 前向宣告
 
+static bool groupInOrder(uint8_t group) {
+    for(uint8_t i = 0; i < GROUP_ORDER_COUNT; i++)
+        if(GROUP_ORDER[i] == group)
+            return true;
+    return false;
+}
+
+/// 把某一組內「已啟用」的通道附加到 steps（停用通道自動跳過）
+static void appendGroup(uint8_t group) {
+    for(uint8_t k = 0; k < GROUP_CHANNELS; k++) {
+        const uint8_t ch = static_cast<uint8_t>(group * GROUP_CHANNELS + k);
+        if(ch < Pca::CHANNEL_COUNT && channelEnabled(ch) &&
+           stepCount < Pca::CHANNEL_COUNT) {
+            stepGroup[stepCount] = group;
+            steps[stepCount++] = ch;
+        }
+    }
+}
+
+/// 'g' 不帶參數時的下一組：依 GROUP_ORDER 前進，最後回到第一組
+static uint8_t nextGroupAfter(uint8_t group) {
+    for(uint8_t i = 0; i < GROUP_ORDER_COUNT; i++)
+        if(GROUP_ORDER[i] == group)
+            return GROUP_ORDER[(i + 1) % GROUP_ORDER_COUNT];
+    return GROUP_ORDER[0];
+}
+
+/// 完整循環：先依觸發順序（g2→g5→g1→g6→g0→g7），補上順序表外的組
 static void buildAllSteps() {
     stepCount = 0;
-    for(uint8_t ch = 0; ch < Pca::CHANNEL_COUNT; ch++)
-        if(channelEnabled(ch))
-            steps[stepCount++] = ch;
+    for(uint8_t i = 0; i < GROUP_ORDER_COUNT; i++)
+        appendGroup(GROUP_ORDER[i]);
+    for(uint8_t g = 0; g < GROUP_COUNT; g++)
+        if(!groupInOrder(g))
+            appendGroup(g);
     stepIdx = 0;
 }
 
 static bool buildGroupSteps(uint8_t group) {
     stepCount = 0;
-    const uint8_t a = static_cast<uint8_t>(group * 2);
-    const uint8_t b = static_cast<uint8_t>(group * 2 + 1);
-    if(channelEnabled(a))
-        steps[stepCount++] = a;
-    if(channelEnabled(b))
-        steps[stepCount++] = b;
+    appendGroup(group);
     stepIdx = 0;
     return stepCount > 0;
 }
@@ -441,7 +506,7 @@ static void start(bool repeat) {
 
 static bool startGroup(uint8_t group) {
     stop();
-    nextGroup = static_cast<uint8_t>((group + 1) % 8);
+    nextGroup = nextGroupAfter(group);
     if(!buildGroupSteps(group)) {
         Serial.printf("[SEQ] 第 %u 組（CH%u/CH%u）都沒有啟用\n", group,
                       static_cast<unsigned>(group * 2),
@@ -453,7 +518,9 @@ static bool startGroup(uint8_t group) {
     phase = PHASE_OUT;
     phaseMs = millis();
     cycleStartMs = phaseMs;
-    Serial.printf("[SEQ] 測試第 %u 組：", group);
+    Serial.printf("[SEQ] 測試第 %u 組（CH%u/CH%u）：", group,
+                  static_cast<unsigned>(group * 2),
+                  static_cast<unsigned>(group * 2 + 1));
     for(uint8_t i = 0; i < stepCount; i++) {
         Serial.printf(" CH%u", steps[i]);
         setAngle(steps[i], homeDeg);
@@ -480,14 +547,39 @@ static void finishCycle() {
         phase = PHASE_OUT;
         phaseMs = millis();
         cycleStartMs = phaseMs;
-        Serial.print("[SEQ] 循環完成，重新開始\n");
+        Serial.print("[SEQ] 循環完成，重新開始（各組續維持 OUT）\n");
         return;
     }
+    // 完成後「不」回 HOME：全部維持在 OUT（開啟）狀態，需 'q' / 'm' 才會回 HOME
     running = false;
     phase = PHASE_NONE;
-    goHomeAll();
-    Serial.printf("[SEQ] 循環完成（%lu ms），全部回 HOME\n",
+    Serial.printf("[SEQ] 循環完成（%lu ms），各組維持 OUT，全部回 HOME 請按 q\n",
                   static_cast<unsigned long>(millis() - cycleStartMs));
+}
+
+static void printMove(uint8_t ch, float deg, const char *suffix) {
+    const int32_t t = static_cast<int32_t>(lroundf(deg * 10.0f));
+    Serial.printf("[SEQ] CH%u → %ld.%u°%s\n", ch, static_cast<long>(t / 10),
+                  static_cast<unsigned>(t % 10), suffix);
+}
+
+/// 這個 step 是不是所屬組的最後一顆
+static bool lastOfGroup(uint8_t idx) {
+    return (static_cast<uint8_t>(idx + 1) >= stepCount) ||
+           (stepGroup[idx + 1] != stepGroup[idx]);
+}
+
+/// 整組切到 OUT 並保持（開啟），回傳開啟了幾顆
+static uint8_t openGroup(uint8_t group) {
+    uint8_t n = 0;
+    for(uint8_t i = 0; i < stepCount; i++) {
+        if(stepGroup[i] != group)
+            continue;
+        setAngle(steps[i], outDeg);
+        printMove(steps[i], outDeg, "（開啟）");
+        n++;
+    }
+    return n;
 }
 
 static void update() {
@@ -498,31 +590,48 @@ static void update() {
     case PHASE_OUT: {
         const uint8_t ch = steps[stepIdx];
         setAngle(ch, outDeg);
-        const int32_t o = static_cast<int32_t>(lroundf(outDeg * 10.0f));
-        Serial.printf("[SEQ] CH%u → %ld.%u°\n", ch, static_cast<long>(o / 10),
-                      static_cast<unsigned>(o % 10));
+        printMove(ch, outDeg, "");
         phase = PHASE_DWELL;
         phaseMs = now;
         break;
     }
     case PHASE_DWELL:
         if(now - phaseMs >= dwellMs) {
-            const uint8_t ch = steps[stepIdx];
-            setAngle(ch, homeDeg);
-            const int32_t h = static_cast<int32_t>(lroundf(homeDeg * 10.0f));
-            Serial.printf("[SEQ] CH%u → %ld.%u°\n", ch, static_cast<long>(h / 10),
-                          static_cast<unsigned>(h % 10));
-            phase = PHASE_SETTLE;
+            setAngle(steps[stepIdx], homeDeg);
+            printMove(steps[stepIdx], homeDeg, "");
+            phase = PHASE_HOME;
             phaseMs = now;
         }
         break;
-    case PHASE_SETTLE:
+    case PHASE_HOME:
         if(now - phaseMs >= settleMs) {
-            stepIdx++;
-            if(stepIdx >= stepCount)
-                finishCycle();
-            else
+            if(lastOfGroup(stepIdx)) {
+                // 組內每顆都驗過了 → 整組一起開到 OUT 並保持
+                phase = PHASE_OPEN;
+            } else {
+                stepIdx++;
                 phase = PHASE_OUT;
+            }
+            phaseMs = now;
+        }
+        break;
+    case PHASE_OPEN: {
+        const uint8_t group = stepGroup[stepIdx];
+        const uint8_t n = openGroup(group);
+        Serial.printf("[SEQ] 第 %u 組完成：%u 顆維持開啟\n",
+                      static_cast<unsigned>(group), static_cast<unsigned>(n));
+        phase = PHASE_GAP;
+        phaseMs = now;
+        break;
+    }
+    case PHASE_GAP:
+        if(now - phaseMs >= settleMs) {
+            if(static_cast<uint8_t>(stepIdx + 1) >= stepCount) {
+                finishCycle();
+            } else {
+                stepIdx++;
+                phase = PHASE_OUT;
+            }
         }
         break;
     default:
@@ -571,7 +680,7 @@ static void printStatus() {
                       static_cast<unsigned>(Seq::stepCount),
                       Seq::steps[Seq::stepIdx]);
     } else {
-        Serial.print("[STATUS] 閒置（所有通道在 HOME）\n");
+        Serial.print("[STATUS] 閒置（保持目前位置；q 全部回 HOME）\n");
     }
     if(sI2cErrors)
         Serial.printf("[STATUS] I2C 累計錯誤 %lu\n",
@@ -583,7 +692,8 @@ static void printLimits() {
     for(uint8_t ch = 0; ch < Pca::CHANNEL_COUNT; ch++) {
         const ChannelLimit &l = Limits::channels[ch];
         Serial.printf("[LIMIT] %2u  %s  %s  %5u   %5u   %3u~%3u°\n", ch,
-                      l.enabled ? "on " : "OFF", l.invert ? "rev" : "fwd",
+                      l.enabled ? "on " : "OFF",
+                      Limits::effectiveInvert(ch) ? "rev" : "fwd",
                       l.minUs, l.maxUs, l.minDeg, l.maxDeg);
     }
 }
@@ -591,12 +701,13 @@ static void printLimits() {
 static void printHelp() {
     Serial.print(
         "\n=== 機構測試 ===\n"
-        "  s            執行一次完整循環（CH0→CH15）\n"
+        "  s            完整循環（依觸發順序 g2→g5→g1→g6→g0→g7）\n"
+        "               每組：逐顆 30→120→30 驗證，再整組開到 120 並保持\n"
         "  S            重複循環（再按 q 停止）\n"
-        "  g [0~7]      測第 n 組（(0,1)=0 ... (14,15)=7）；不給參數 = 依序下一組\n"
+        "  g [0~7]      測第 n 組（(0,1)=0 ... (14,15)=7）；不給參數 = 依觸發順序下一組\n"
         "  q            停止，全部回 HOME\n"
         "  m <home> <out>       設定角度（預設 30 120）\n"
-        "  t <dwell> <settle>   設定停留/回位等待 ms（預設 1000 500）\n"
+        "  t <dwell> <settle>   設定 OUT 停留 / 回位與換組等待 ms（預設 1000 500）\n"
         "  p            狀態\n"
         "  l            各通道校正設定\n"
         "  x            緊急關閉全部輸出\n"
@@ -654,7 +765,7 @@ static void handleCommand(char *line) {
             return;
         }
         if(!parseLong(argv[1], &a) || a < 0 || a > 7) {
-            Serial.print("用法：g [0~7]（不給參數=依序下一組）\n");
+            Serial.print("用法：g [0~7]（不給參數=依觸發順序下一組）\n");
             return;
         }
         Seq::startGroup(static_cast<uint8_t>(a));
