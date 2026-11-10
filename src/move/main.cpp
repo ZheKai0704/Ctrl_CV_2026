@@ -638,11 +638,13 @@ static void onMoveEstop() {
 // ============================================================================
 // 狀態 LED（板載 LED，例如 Waveshare RP2350 Plus 板上 LED）
 //
-// 只有三種狀態，全部由「通訊狀況」決定：
+// 四種狀態，全部由「通訊 / E-Stop 狀況」決定
+//   （優先權：BOOT > ESTOP > ACTIVE > IDLE）：
 //   ┌────────────────────┬──────────────┬──────────────────────┐
 //   │ 狀態               │ 圖樣         │ 亮 / 滅              │
 //   ├────────────────────┼──────────────┼──────────────────────┤
 //   │ 未連線 / 剛開機    │ 長亮         │ —                    │
+//   │ E-Stop 生效        │ 長亮         │ —                    │
 //   │ 已連線但 Idle      │ 0.5Hz 慢閃   │ 500ms / 1500ms       │
 //   │ 資料通訊中         │ 1Hz 短脈心跳 │ 80ms / 920ms         │
 //   └────────────────────┴──────────────┴──────────────────────┘
@@ -651,6 +653,9 @@ static void onMoveEstop() {
 //   * 「未連線」= 開機至今從未收到任何有效控制幀（validCmdCount == 0）。
 //     此時 SlaveComms 的 100ms 指令逾時保護也已生效（馬達歸零），
 //     監控會顯示 E-Stop（cmd timeout），LED 長亮代表「未連線 / 未受控」。
+//   * 「E-Stop 生效」= slave.isEstopActive()（Hub 明確下令 ESTOP，或本機
+//     100ms 指令逾時自動觸發）。E-Stop 一律長亮，不做閃爍——閃爍容易
+//     被誤認為「正常待機」，長亮才能一眼看出「現在沒有出力」。
 //   * 「資料通訊中」= 最後有效控制幀距今 < ACTIVE_TIMEOUT_MS（Jetson 端
 //     韌體以 Hub 收到控制幀的頻率轉發，典型 10–20ms 一幀）
 //   * 「已連線但 Idle」= 曾連上 Hub，但目前超過 ACTIVE_TIMEOUT_MS 沒有
@@ -671,16 +676,18 @@ constexpr uint32_t IDLE_ON_MS = 500;
 constexpr uint32_t IDLE_OFF_MS = 1500;
 } // namespace LedCfg
 
-enum class LedState : uint8_t { BOOT = 0, IDLE = 1, ACTIVE = 2 };
+enum class LedState : uint8_t { BOOT = 0, IDLE = 1, ACTIVE = 2, ESTOP = 3 };
 
 // 亮滅圖樣表：索引 = LedState 的數值（相位推進交給 StatusLed）
 //   BOOT   → 長亮（剛開機、從未收到有效幀）
 //   IDLE   → 0.5Hz 慢閃，鎮定不擾人
 //   ACTIVE → 1Hz 短脈衝心跳（像路由器資料燈）
+//   ESTOP  → 長亮（沒有出力，必須一眼看出）
 static const StatusLed::Pattern kLedPatterns[] = {
     {0, 0, true},                                         // BOOT：長亮
     {LedCfg::IDLE_ON_MS, LedCfg::IDLE_OFF_MS, false},     // IDLE
     {LedCfg::ACTIVE_ON_MS, LedCfg::ACTIVE_OFF_MS, false}, // ACTIVE
+    {0, 0, true},                                         // ESTOP：長亮
 };
 static constexpr uint8_t LED_PATTERN_COUNT =
     static_cast<uint8_t>(sizeof(kLedPatterns) / sizeof(kLedPatterns[0]));
@@ -692,8 +699,10 @@ static const char *ledStateName(LedState st) {
         return "BOOT";
     case LedState::IDLE:
         return "IDLE";
-    default:
+    case LedState::ACTIVE:
         return "ACTIVE";
+    default:
+        return "ESTOP";
     }
 }
 
@@ -703,6 +712,8 @@ static volatile uint8_t dbg_ledState = static_cast<uint8_t>(LedState::BOOT);
 static LedState currentLedState() {
     if(slave.validCmdCount() == 0)
         return LedState::BOOT; // 開機至今從未收到有效幀
+    if(slave.isEstopActive())
+        return LedState::ESTOP; // E-Stop 生效 → 長亮
     if(slave.msSinceLastValidCmd() < LedCfg::ACTIVE_TIMEOUT_MS)
         return LedState::ACTIVE; // 資料通訊中
     return LedState::IDLE; // 已連線，但目前沒有控制流

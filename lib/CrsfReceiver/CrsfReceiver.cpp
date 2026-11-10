@@ -99,8 +99,9 @@ void CrsfReceiver::begin(uint8_t uart_id, uint8_t rx_pin, uint32_t baudrate) {
     irq_set_enabled(irq_num, true);
     uart_set_irq_enables(uart, true, false);
 
-    pinMode(LED_BUILTIN, OUTPUT);
-    digitalWrite(LED_BUILTIN, HIGH);
+    // LED 預設交給呼叫端的 StatusLed 管理；只有 setLedEnabled(true) 才由本類別驅動
+    if(_ledEnabled)
+        pinMode(LED_BUILTIN, OUTPUT);
     _lastValidFrameTime = millis();
 }
 
@@ -196,6 +197,7 @@ void CrsfReceiver::update() {
         while(ringTail0 != ringHead0) {
             uint8_t byte = ringBuf0[ringTail0];
             ringTail0 = (ringTail0 + 1) % RING_SIZE;
+            _rxBytes++;
             if(feedByte(byte))
                 newFrameReceived = true;
         }
@@ -203,6 +205,7 @@ void CrsfReceiver::update() {
         while(ringTail1 != ringHead1) {
             uint8_t byte = ringBuf1[ringTail1];
             ringTail1 = (ringTail1 + 1) % RING_SIZE;
+            _rxBytes++;
             if(feedByte(byte))
                 newFrameReceived = true;
         }
@@ -211,6 +214,7 @@ void CrsfReceiver::update() {
     if(newFrameReceived) {
         _lastValidFrameTime = currentTime;
         _isFailsafeActive = false;
+        _frameCount++;
 
         uint16_t raw_channels[16];
         decodeRcChannels(_frameBuf + 3, raw_channels);
@@ -218,7 +222,8 @@ void CrsfReceiver::update() {
         for(uint8_t idx = 0; idx < 10; idx++) {
             _finalChannels[idx] = normalizeChannel(raw_channels[idx], idx);
         }
-        digitalWrite(LED_BUILTIN, !digitalRead(LED_BUILTIN)); // 正常閃爍
+        if(_ledEnabled)
+            digitalWrite(LED_BUILTIN, !digitalRead(LED_BUILTIN)); // 正常閃爍
     }
 
     // 檢查超時
@@ -228,7 +233,7 @@ void CrsfReceiver::update() {
             _finalChannels[idx] = 0;
         _finalChannels[4] = 0; // rc[4]：Failsafe 保護 → < 0 是「投射輪開」，所以強制歸 0（停轉）
 
-        if(currentTime - _lastLedToggleTime >= 100) {
+        if(_ledEnabled && currentTime - _lastLedToggleTime >= 100) {
             _lastLedToggleTime = currentTime;
             digitalWrite(LED_BUILTIN, !digitalRead(LED_BUILTIN)); // 狂暴快閃
         }

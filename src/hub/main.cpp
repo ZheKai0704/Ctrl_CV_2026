@@ -340,11 +340,11 @@ static CrsfReceiver crsf;
 // ============================================================================
 // Core 0 內部狀態 — Jetson 連線追蹤 & RC 備援序號
 // ============================================================================
-static uint64_t lastJetsonFrameUs = 0; // 最後收到 Jetson 有效封包的時間
-static uint32_t jetsonFrameCount = 0;  // Jetson 有效封包累計（LED 判斷用）
+static uint64_t lastJetsonFrameUs = 0;  // 最後收到 Jetson 有效封包的時間
+static uint32_t jetsonFrameCount = 0;   // Jetson 有效封包累計（LED 判斷用）
 static uint32_t jetsonDroppedCount = 0; // 因「遙控接管」而被丟棄的 Jetson 幀數
-static uint8_t rcFallbackSeq = 0;      // RC 備援轉發用的 frameSeq
-static uint64_t lastRcForwardUs = 0;   // RC 備援最後轉發時間
+static uint8_t rcFallbackSeq = 0;       // RC 備援轉發用的 frameSeq
+static uint64_t lastRcForwardUs = 0;    // RC 備援最後轉發時間
 
 // ============================================================================
 // 控制來源（本版規則）
@@ -367,10 +367,15 @@ static ControlSource gSource = ControlSource::JETSON;
 // ============================================================================
 // 狀態 LED（板載 LED_BUILTIN）— 與 Move Slave 相同的顯示邏輯
 //
+//   * 完全沒收到任何訊號（Jetson 沒送幀且遙控也斷線）→ 長亮
 //   * E-Stop（Jetson 逾時且 RC Failsafe）→ 長亮
-//   * 剛開機、從未收到 Jetson 幀 → 長亮
-//   * 資料通訊中（< ACTIVE_TIMEOUT_MS）→ 1Hz 短脈衝
-//   * 已連線但 Idle（Jetson 暫停送資料、RC 仍正常）→ 0.5Hz 慢閃
+//   * 資料通訊中（Jetson 幀 < ACTIVE_TIMEOUT_MS、或遙控接管中）→ 1Hz 短脈衝
+//   * 已連線但 Idle（Jetson 暫停送資料、遙控仍在線但沒接管）→ 0.5Hz 慢閃
+//
+// ⚠ 這顆 LED 只由 Core 0（這裡）驅動。CrsfReceiver 內的 Core 1 若也 toggle
+//   LED_BUILTIN（收到 RC 幀翻一次、Failsafe 每 100ms 翻一次），兩顆核心會
+//   互搶同一個腳位，畫面就變成無法解釋的快閃。因此 CrsfReceiver 的燈號已預設
+//   關閉（setLedEnabled(false)），Hub 只用本狀態機。
 // ============================================================================
 namespace LedCfg {
 // 視為「資料通訊中」的視窗（略大於典型控制週期，避免閃斷）
@@ -383,7 +388,7 @@ enum class LedState : uint8_t { BOOT = 0,
                                 ACTIVE = 3 };
 
 // 亮滅圖樣表：索引 = LedState 的數值（相位推進交給 StatusLed）
-//   BOOT   → 長亮（剛開機、從未收到 Jetson 幀）
+//   BOOT   → 長亮（完全沒收到任何訊號：Jetson 沒送幀且遙控也斷線）
 //   ESTOP  → 長亮（Jetson 逾時且 RC Failsafe）
 //   IDLE   → 0.5Hz 慢閃，鎮定不擾人
 //   ACTIVE → 1Hz 短脈衝心跳（像路由器資料燈）
@@ -397,15 +402,29 @@ static constexpr uint8_t LED_PATTERN_COUNT =
     static_cast<uint8_t>(sizeof(kLedPatterns) / sizeof(kLedPatterns[0]));
 static StatusLed statusLed(LED_BUILTIN, kLedPatterns, LED_PATTERN_COUNT);
 
+// 遙控是否真的在送資料（Core 1 寫的計數 + Failsafe 旗標）
+static bool rcLinkAlive() {
+    return !rc_failsafe && crsf.getFrameCount() > 0;
+}
+
 static LedState currentLedState() {
-    if(jetsonFrameCount == 0)
-        return LedState::BOOT; // 開機至今從未收到 Jetson 有效幀
-    if(time_us_64() - lastJetsonFrameUs <
-       static_cast<uint64_t>(LedCfg::ACTIVE_TIMEOUT_MS) * 1000ULL)
-        return LedState::ACTIVE; // Jetson 控制流正常
-    if(rc_failsafe)
-        return LedState::ESTOP; // Jetson 斷線且遙控也斷線
-    return LedState::IDLE;      // Jetson 無資料，但遙控備援仍連線
+    const uint64_t nowUs = time_us_64();
+    // Jetson 控制流正常（典型 10–20ms 一幀）
+    const bool jetsonActive =
+        (nowUs - lastJetsonFrameUs) <
+        static_cast<uint64_t>(LedCfg::ACTIVE_TIMEOUT_MS) * 1000ULL;
+
+    // 兩種來源都沒資料 → 長亮（剛開機或完全沒受控）
+    if(jetsonFrameCount == 0 && !rcLinkAlive())
+        return LedState::BOOT;
+    // Jetson 沒資料、遥控也斷線 → E-Stop，長亮
+    if(!jetsonActive && rc_failsafe)
+        return LedState::ESTOP;
+    // 有控制流：Jetson 在送幀，或遙控正接管（rc[5] 切換 / Jetson 逾時備援）
+    if(jetsonActive || gSource != ControlSource::JETSON)
+        return LedState::ACTIVE;
+    // 曾連上 Jetson，目前沒控制流（遥控在線但沒接管）→ 慢閃
+    return LedState::IDLE;
 }
 
 static void updateStatusLed() {
@@ -487,15 +506,15 @@ static int8_t rcToInt8(int16_t rcVal) {
 //   STORAGE_TRIGGER = rc[8] → < 0 觸發機構
 //         若你的旋轉改插別的通道，把 OMEGA 換成對應的 0-based 索引即可。
 namespace RcMap {
-constexpr uint8_t VX = 0;              // rc[0]
-constexpr uint8_t VY = 1;              // rc[1]
-constexpr uint8_t OMEGA = 6;           // rc[6]
+constexpr uint8_t VX = 0;    // rc[0]
+constexpr uint8_t VY = 1;    // rc[1]
+constexpr uint8_t OMEGA = 6; // rc[6]
 // Shoot 投射輪啟停：< 0 → 開（轉速固定 50%），≥ 0 → 0%（停轉）
-constexpr uint8_t SHOOT_ENABLE = 4;    // rc[4]
+constexpr uint8_t SHOOT_ENABLE = 4; // rc[4]
 // 控制來源切換：< -10 → 遙控優先（強制走 RC），其餘 → Jetson 優先
-constexpr uint8_t SOURCE_SELECT = 5;   // rc[5]
+constexpr uint8_t SOURCE_SELECT = 5; // rc[5]
 // 上下射轉速微調：< -10 → +5%，> +10 → -5%（上下兩顆同時）
-constexpr uint8_t SHOOT_SPEED = 6;     // rc[6]
+constexpr uint8_t SHOOT_SPEED = 6; // rc[6]
 // Storage 機構觸發：< 0 就開始「全部通道跑一次」（Storage 端做上緣觸發）
 constexpr uint8_t STORAGE_TRIGGER = 8; // rc[8]
 // 方向修正（實機實測）：前後正常，左右與 cw/ccw 相反 → 這兩個反相。
@@ -593,11 +612,11 @@ static constexpr bool RC_FORWARD_SHOOT = true;
 //   回推同樣次數就回到 50%。上下兩顆無刷永遠同一個值。
 // ============================================================================
 namespace RcShootCfg {
-constexpr int16_t BASE_PCT = 50;   // 固定基準轉速 (%)
-constexpr int16_t STEP_PCT = 5;    // 每次微調量 (%)
-constexpr int16_t TRIM_MIN = -50;  // 微調下限 → 50-50 = 0%
-constexpr int16_t TRIM_MAX = +50;  // 微調上限 → 50+50 = 100%
-constexpr int16_t DEADBAND = 10;   // |rc| <= 10 視為中立（不動作）
+constexpr int16_t BASE_PCT = 50;       // 固定基準轉速 (%)
+constexpr int16_t STEP_PCT = 5;        // 每次微調量 (%)
+constexpr int16_t TRIM_MIN = -50;      // 微調下限 → 50-50 = 0%
+constexpr int16_t TRIM_MAX = +50;      // 微調上限 → 50+50 = 100%
+constexpr int16_t DEADBAND = 10;       // |rc| <= 10 視為中立（不動作）
 constexpr uint32_t HOLD_REPEAT_MS = 0; // 0 = 只做方向邊緣觸發
 } // namespace RcShootCfg
 
@@ -953,9 +972,6 @@ void setup() {
 void loop() {
     jetsonComms.update();
 
-    // 狀態 LED（與 Move Slave 相同邏輯：E-Stop 長亮、通訊中快閃、Idle 慢閃）
-    updateStatusLed();
-
     // 輪詢各 PIO UART RX，接收 Slave 回傳的 COBS 遙測幀
     processPioRx(moveUart, moveRxBuf, "Move", latestMoveTm, lastMoveTmUs);
     processPioRx(shootUart, shootRxBuf, "Shoot", latestShootTm, lastShootTmUs);
@@ -976,6 +992,9 @@ void loop() {
         onControlSourceChanged(gSource, src);
         gSource = src;
     }
+
+    // 狀態 LED：必須在 gSource 決定後才更新（狀態機要用本圈的控制來源）
+    updateStatusLed();
 
     // 只有非 Jetson 模式才會產生任何 RC 命令（Jetson 模式完全碰不到 RC 值）
     if(gSource != ControlSource::JETSON)
