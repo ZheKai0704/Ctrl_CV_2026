@@ -44,8 +44,14 @@
 #include "servo_pulse.pio.h"
 #include "step_pulse.pio.h"
 #include <Arduino.h>
+#include <DebugFmt.h>
 #include <EEPROM.h>
+#include <EepromStore.h>
+#include <MathUtils.h>
+#include <PioStepRate.h>
+#include <StatusLed.h>
 #include <cmath>
+#include <cstring> // memmove()
 #include <hardware/pio.h>
 #include <pico/stdlib.h>
 
@@ -377,19 +383,10 @@ static PIO sPio = pio0;
 static uint sSm = 0;
 static uint sOffset = 0;
 constexpr uint kIrqFlag = 0;
+// 每步的 PIO 週期數（set[3] 4 + set[1] 2 + jmp 1）：這是 step_pulse.pio 的程式知識，
+// 留在本檔；速率 → clkdiv 的換算走 PioStepRate::clkdivForSps()。
 constexpr float kCyclesPerStep = 7.0f; // set[3] 4 + set[1] 2 + jmp 1
 static float sClkSysHz = 150000000.0f;
-
-static float divForSps(float sps) {
-    float div = sClkSysHz / (kCyclesPerStep * sps);
-    if(div < 1.0f) {
-        div = 1.0f;
-    }
-    if(div > 65536.0f) {
-        div = 65536.0f;
-    }
-    return div;
-}
 
 /// 只把本 SM 的 STEP 腳位拉低。
 /// ⚠ 不可用 pio_sm_set_pins()：SDK 會用「victim SM」把整個 PIO 區塊 32 支腳全部寫一次，
@@ -474,7 +471,9 @@ static void startSegment(int32_t steps) {
         pio_sm_restart(sPio, sSm);
         pio_sm_exec(sPio, sSm, pio_encode_jmp(sOffset));
         pio_interrupt_clear(sPio, kIrqFlag);
-        pio_sm_set_clkdiv(sPio, sSm, divForSps(curSps));
+        pio_sm_set_clkdiv(
+            sPio, sSm,
+            PioStepRate::clkdivForSps(sClkSysHz, kCyclesPerStep, curSps));
         pio_sm_put(sPio, sSm, static_cast<uint32_t>(steps > 0 ? steps : -steps));
         pio_sm_set_enabled(sPio, sSm, true);
     }
@@ -529,7 +528,9 @@ void update() {
         }
     }
     if(pioReady) {
-        pio_sm_set_clkdiv(sPio, sSm, divForSps(curSps));
+        pio_sm_set_clkdiv(
+            sPio, sSm,
+            PioStepRate::clkdivForSps(sClkSysHz, kCyclesPerStep, curSps));
     }
 }
 
@@ -563,10 +564,10 @@ void init() {
     EEPROM.get(ADDR_UP_SPEED, persistentUpSpeed);
     EEPROM.get(ADDR_DOWN_SPEED, persistentDownSpeed);
     // 若 flash 尚未初始化（全 0xFF），float 會是 NaN → 歸零
-    if(std::isnan(persistentUpSpeed))
-        persistentUpSpeed = 0.0f;
-    if(std::isnan(persistentDownSpeed))
-        persistentDownSpeed = 0.0f;
+    // ⚠ 本節點維持「兩個裸 float 欄位」的既有 flash 版面（不做 magic/checksum），
+    //   只借用 EepromStore::sanitizeFloat 擋抹除態，版面位元等價。
+    persistentUpSpeed = EepromStore::sanitizeFloat(persistentUpSpeed);
+    persistentDownSpeed = EepromStore::sanitizeFloat(persistentDownSpeed);
 }
 
 // 只在值真的改變時才寫 flash。
@@ -608,17 +609,6 @@ float getDownSpeed() { return persistentDownSpeed; }
 // 但 ESC 必須繼續收到 1500µs 中立訊號才不會亂轉，所以由 Core 0 持續補 FIFO。
 // 跨核心傳遞用 32-bit volatile（單一字組寫入即 atomic，不需鎖）。
 // ============================================================================
-// 單向電調的轉速正規化（BldcControl 與 onShootCommand 共用）：
-//   NaN → 0、負值取大小（電調單向）、上限 100
-static float sanitizeSpeed(float speed) {
-    if(std::isnan(speed))
-        return 0.0f;
-    if(speed < 0.0f)
-        speed = -speed;
-    if(speed > 100.0f)
-        speed = 100.0f;
-    return speed;
-}
 
 namespace BldcControl {
 constexpr uint32_t FRAME_US = 20000;   // 50Hz
@@ -706,8 +696,9 @@ void init() {
 }
 
 // speed 0~100 → 1500~2000µs（0% 必須是 1500 中立，才會停轉）
+// 輸入先過 MathUtils::sanitizePercent：NaN → 0、負值取大小（電調單向）、上限 100
 static uint16_t speedToPulse(float speed) {
-    speed = sanitizeSpeed(speed);
+    speed = MathUtils::sanitizePercent(speed);
     if(speed == 0.0f)
         return PULSE_MID;
     float absSpd = fabsf(speed);
@@ -752,28 +743,12 @@ static volatile int8_t dbg_lastRow = 0;
 static volatile int8_t dbg_lastUp = 0;
 static volatile int8_t dbg_lastDown = 0;
 
-// 把 float 以「整數 + 一位小數」印出來
-// （newlib-nano 的 printf 沒開浮點（_printf_float），%f/%.1f 會直接印不出東西）
-static void printFixed1(float value) {
-    int32_t v10 = static_cast<int32_t>(lroundf(value * 10.0f));
-    const char *sign = (v10 < 0) ? "-" : "";
-    if(v10 < 0) {
-        v10 = -v10;
-    }
-    Serial.printf("%s%ld.%ld", sign, static_cast<long>(v10 / 10),
-                  static_cast<long>(v10 % 10));
-}
-
 // E-Stop 期間仍要告訴 Hub「我被停了」（遙測只在收到命令時才組，所以另外補送）
 constexpr uint32_t ESTOP_TM_INTERVAL_MS = 200;
 
 /// 組遙測帧（Core 1 context）
 static void buildTelemetry(uint8_t estopFlag) {
     pendingTm = {};
-    pendingTm.sync = 0xA5;
-    pendingTm.msgType = MsgType::TELEMETRY;
-    pendingTm.frameSeq = tmFrameSeq++;
-    pendingTm.targetID = TargetID::HUB;
     // Shoot 遙測：復用 float 陣列
     // currentRps[0] = 上輪速度, [1] = 下輪速度
     // currentRps[2] = 仰角實測角度(°), [3] = 水平目前步數
@@ -787,11 +762,13 @@ static void buildTelemetry(uint8_t estopFlag) {
     pendingTm.targetRps[3] = static_cast<float>(RowStepper::positionSteps());
     pendingTm.mode = RobotMode::AUTO;
     pendingTm.estopFlag = estopFlag;
-    pendingTm.timestamp = time_us_64();
-    pendingTm.crc16 = 0;
-    pendingTm.crc16 =
-        SignalUtils::calculateCrc(reinterpret_cast<const uint8_t *>(&pendingTm),
-                                  sizeof(MoveTelemetry) - 2);
+    // ⚠ 遙測標頭（sync/msgType/frameSeq/targetID）、timestamp 與 CRC 由
+    //   SignalUtils::finalizeTelemetry 統一填寫；手寫漏填 sync 或 CRC 會讓
+    //   Hub 端驗證失敗而整包丟棄（序列監控只看到 "CRC mismatch"）。
+    //   CRC 計算範圍不含 crc16 自身；timestamp 維持 us 計時的低 32 bits。
+    SignalUtils::finalizeTelemetry(
+        pendingTm, tmFrameSeq++,
+        static_cast<uint32_t>(time_us_64() & 0xFFFFFFFFULL));
 }
 
 static void onShootCommand(const ChassisSnapshot &cmd) {
@@ -800,8 +777,8 @@ static void onShootCommand(const ChassisSnapshot &cmd) {
     dbg_lastRow = static_cast<int8_t>(lroundf(cmd.row));
 
     // 轉速：單向電調 → 正規化成 0~100（NaN/負值/超範圍都在這裡收乾）
-    const float upSpeed = sanitizeSpeed(cmd.shootUpSpeed);
-    const float downSpeed = sanitizeSpeed(cmd.shootDownSpeed);
+    const float upSpeed = MathUtils::sanitizePercent(cmd.shootUpSpeed);
+    const float downSpeed = MathUtils::sanitizePercent(cmd.shootDownSpeed);
     dbg_lastUp = static_cast<int8_t>(lroundf(upSpeed));
     dbg_lastDown = static_cast<int8_t>(lroundf(downSpeed));
 
@@ -909,6 +886,22 @@ constexpr uint32_t ESTOP_OFF_MS = 100;
 
 enum class LedState : uint8_t { BOOT = 0, IDLE = 1, ACTIVE = 2, ESTOP = 3 };
 
+// 亮滅圖樣表：索引 = LedState 的數值（相位推進交給 StatusLed）
+//   BOOT   → 長亮（剛開機、從未收到有效帧）
+//   IDLE   → 0.5Hz 慢閃，鎮定不擾人
+//   ACTIVE → 1Hz 短脈衝心跳（像路由器資料燈）
+//   ESTOP  → 5Hz 快閃
+static const StatusLed::Pattern kLedPatterns[] = {
+    {0, 0, true},                                         // BOOT：長亮
+    {LedCfg::IDLE_ON_MS, LedCfg::IDLE_OFF_MS, false},     // IDLE
+    {LedCfg::ACTIVE_ON_MS, LedCfg::ACTIVE_OFF_MS, false}, // ACTIVE
+    {LedCfg::ESTOP_ON_MS, LedCfg::ESTOP_OFF_MS, false},   // ESTOP
+};
+
+static constexpr uint8_t LED_PATTERN_COUNT =
+    static_cast<uint8_t>(sizeof(kLedPatterns) / sizeof(kLedPatterns[0]));
+static StatusLed statusLed(LED_BUILTIN, kLedPatterns, LED_PATTERN_COUNT);
+
 static const char *ledStateName(LedState st) {
     switch(st) {
     case LedState::BOOT:
@@ -936,46 +929,12 @@ static LedState currentLedState() {
 }
 
 static void updateStatusLed() {
-    static LedState lastState = LedState::BOOT;
-    static bool ledOn = false;
-    static uint32_t phaseStartMs = 0;
+    const uint8_t st = static_cast<uint8_t>(currentLedState());
+    dbg_ledState = st; // 除錯輸出與 LED 實際套用的狀態一致
 
-    const LedState st = currentLedState();
-    const uint32_t now = millis();
-
-    dbg_ledState = static_cast<uint8_t>(st);
-
-    // 狀態切換 → 重置相位並立刻點亮（新狀態立即可見）
-    if(st != lastState) {
-        lastState = st;
-        phaseStartMs = now;
-        ledOn = true;
-        digitalWrite(LED_BUILTIN, HIGH);
-    }
-
-    // 未連線 / 剛開機 → 長亮
-    if(st == LedState::BOOT) {
-        digitalWrite(LED_BUILTIN, HIGH);
-        return;
-    }
-
-    uint32_t onMs = LedCfg::ACTIVE_ON_MS;
-    uint32_t offMs = LedCfg::ACTIVE_OFF_MS;
-    if(st == LedState::IDLE) {
-        onMs = LedCfg::IDLE_ON_MS;
-        offMs = LedCfg::IDLE_OFF_MS;
-    } else if(st == LedState::ESTOP) {
-        onMs = LedCfg::ESTOP_ON_MS;
-        offMs = LedCfg::ESTOP_OFF_MS;
-    }
-
-    // 非阻塞相位推進：亮滿 onMs → 焭，焭滿 offMs → 亮
-    const uint32_t phaseMs = ledOn ? onMs : offMs;
-    if(now - phaseStartMs >= phaseMs) {
-        phaseStartMs = now;
-        ledOn = !ledOn;
-        digitalWrite(LED_BUILTIN, ledOn ? HIGH : LOW);
-    }
+    // 狀態切換 → 重置相位並立刻點亮；長亮狀態持續 HIGH；其餘亮滿 onMs 熄、
+    // 熄滿 offMs 亮（非阻塞，見 StatusLed::update）。
+    statusLed.update(st, millis());
 }
 
 // ============================================================================
@@ -991,7 +950,7 @@ void setup() {
     RowStepper::init();
     elevSerial.begin(115200); // PIO 模擬 UART → 仰角步進驅動器
 
-    pinMode(LED_BUILTIN, OUTPUT);
+    statusLed.begin();
     digitalWrite(LED_BUILTIN, HIGH); // 開機先亮（BOOT 狀態）
 
     Serial.begin(115200);
@@ -1031,10 +990,11 @@ void loop() {
                           ledStateName(static_cast<LedState>(dbg_ledState)),
                           static_cast<int>(dbg_lastPitch),
                           static_cast<int>(dbg_lastRow));
+            // 不用 %f：newlib-nano 沒開 _printf_float，改用 DebugFmt 的整數手法
             Serial.print("仰角 ");
-            printFixed1(ElevStepper::reportedAngleDeg());
+            DebugFmt::printFixed1(Serial, ElevStepper::reportedAngleDeg());
             Serial.print("° (cmd ");
-            printFixed1(ElevStepper::commandedAngleDeg());
+            DebugFmt::printFixed1(Serial, ElevStepper::commandedAngleDeg());
             Serial.printf("°) 水平 %ld 步 | up=%d down=%d | rx=%u crc=%u | elev rep=%u frx=%u\n",
                           static_cast<long>(RowStepper::positionSteps()),
                           static_cast<int>(upSpeed), static_cast<int>(downSpeed),

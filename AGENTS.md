@@ -460,12 +460,36 @@ UART0 @ 420000 baud
 - 通道校正（min/max μs、實體角度範圍、反向、啟用）沿用 EEPROM，格式與
   `pca9685_angle` / `test/mechanism` 相同（MAGIC `PCA4`），無設定時預設
   16 通道全啟用、600~2400μs、0~180°、正向
+- **每顆伺服獨立角度**：`SeqCfg::PROFILE[16]`，每通道一組
+  `{startDeg, endDeg, reverse}`（`reverse=false` → 動作 `start→end`、平常停 `start`；
+  `reverse=true` → 動作 `end→start`、平常停 `end`），
+  透過 `SeqCfg::restDeg(ch)` / `SeqCfg::activeDeg(ch)` 取得待機 / 作動角度。
+  預設全部 `{30, 100, false}`，CH6 為 `{75, 30, false}`。
 - 動作：`trigger` **每上緣一次做一個動作**，等下一次 trigger；
   順序 `g2×5 → g5×5 → g1×5 → g6×5 → g0×5 → g7×5`（共 30 次，組 n = CH(2n)、CH(2n+1)）；
-  每個動作 = 組內每顆已啟用通道 `OUT(120°) → 停留 1s → HOME(30°) → 等 0.5s`；
-  **每組的第 5 次（最後一輪）**驗證完後，整組一起開到 `OUT(120°)` 並維持開啟（不回 HOME），
-  先前已開啟的組也會一直保持；下一次完整循環（回到第 1 動）開始前才全部回 HOME。
+  每個動作 = 組內每顆已啟用通道 `作動角度 → 停留 1s → 待機角度 → 等 0.5s`
+  （角度由各自的 `PROFILE` 決定）；
+  **每組的第 5 次（最後一輪）**驗證完後，整組一起開到作動角度並維持開啟（不回待機），
+  先前已開啟的組也會一直保持；下一次完整循環（回到第 1 動）開始前才全部回待機。
   全部 30 次做完後，下一次 trigger 從 g2 重新開始；E-Stop 會全部歸 HOME 並歸零序列。
+- **追加動作**：每次 trigger 的主序列動作做完後，CH6 從待機 75° 打到 30°、
+  停留 1s 再回 75°。CH6 不在 `GROUP_ORDER` 內，上電 / E-Stop / 新一輪循環開始時
+  都停在自己的待機角度，主序列其餘通道維持在各自待機角度
+  （參數 `SeqCfg::POST_CHANNEL / POST_DWELL_MS`，角度同樣取自 `SeqCfg::PROFILE[6]`）。
+- **CH6 一律驅動**：CH6 通常不在 EEPROM 校正的 enabled 名單內，只寫 `full-OFF`
+  等於沒脈衝，伺服務會不鎖定而持續抖動；所以 `SeqCfg::POST_FORCE_ENABLE = true`
+  強制驅動它（仍套用該通道的 min/max µs、角度範圍、反向校正）。
+- **上電順序**：`Pca9685::begin(..., deferOutputs=true)` 先讓晶片停在 SLEEP，
+  在 SLEEP 期間把所有通道目標角度寫好，再 `wakeOutputs()` 開始送 PWM；
+  若 MODE1.SLEEP 沒清掉會自動退回傳統初始化（避免整台伺服沒脈衝）。
+- **不停用通道也不寫 full-OFF**：`DRIVE_DISABLED_CHANNELS = true` 讓 EEPROM
+  `enabled=0` 的通道也停在自己的待機角度、保持鎖定（full-OFF = 輸出恆低 = 沒脈衝，
+  伺服會失去鎖定）。
+- **遙測保活**：Core 1 的 idleHook 每 40ms 刷新一次遙測（不限於收到命令時），
+  否則 Hub 500ms 收不到就會送 REBOOT，Storage 反覆重開機 → 伺服行為全亂。
+- **開機自檢**：Core 1 讀回 PCA9685 的 MODE1 / PRESCALE / 16 通道 OFF 值成快照，
+  Core 0 印成對照表（EEPROM 期望 µs vs 晶片實際值 / full-OFF / 被角度範圍夾住）；
+  執行期每 2s 也在 Core 1 讀回 CH6，異常才印 log。
 - `StoragePayload.motorChannel` / `.sw` 目前保留未使用
 
 ### 5. Ultrasonic 節點

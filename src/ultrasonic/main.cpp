@@ -61,28 +61,28 @@ static constexpr int32_t DIST_OFFSET_MM =
 // ============================================================================
 
 // --- 前方感測器（面向前方）---
-static constexpr uint8_t PIN_TRIG_FRONT_LEFT = 2;  // GP2  = Pin 4   | Trigger
-static constexpr uint8_t PIN_ECHO_FRONT_LEFT = 3;  // GP3  = Pin 5   | Echo
-static constexpr uint8_t PIN_TRIG_FRONT_RIGHT = 4; // GP4  = Pin 6   | Trigger
-static constexpr uint8_t PIN_ECHO_FRONT_RIGHT = 5; // GP5  = Pin 7   | Echo
+static constexpr uint8_t PIN_TRIG_FRONT_LEFT = 12;  // GP2  = Pin 4   | Trigger
+static constexpr uint8_t PIN_ECHO_FRONT_LEFT = 13;  // GP3  = Pin 5   | Echo
+static constexpr uint8_t PIN_TRIG_FRONT_RIGHT = 14; // GP4  = Pin 6   | Trigger
+static constexpr uint8_t PIN_ECHO_FRONT_RIGHT = 15; // GP5  = Pin 7   | Echo
 
 // --- 後方感測器（面向後方）---
-static constexpr uint8_t PIN_TRIG_BACK_LEFT = 6;  // GP6 = Pin 9  | Trigger
-static constexpr uint8_t PIN_ECHO_BACK_LEFT = 7;  // GP7 = Pin 10 | Echo
-static constexpr uint8_t PIN_TRIG_BACK_RIGHT = 8; // GP8 = Pin 11 | Trigger
-static constexpr uint8_t PIN_ECHO_BACK_RIGHT = 9; // GP9 = Pin 12 | Echo
+static constexpr uint8_t PIN_TRIG_BACK_LEFT = 20; // GP6 = Pin 9  | Trigger
+static constexpr uint8_t PIN_ECHO_BACK_LEFT = 21; // GP7 = Pin 10 | Echo
+static constexpr uint8_t PIN_TRIG_BACK_RIGHT = 2; // GP8 = Pin 11 | Trigger
+static constexpr uint8_t PIN_ECHO_BACK_RIGHT = 3; // GP9 = Pin 12 | Echo
 
 // --- 左側感測器（面向左方）---
-static constexpr uint8_t PIN_TRIG_LEFT_1 = 10;
-static constexpr uint8_t PIN_ECHO_LEFT_1 = 11; // GP11 = Pin 17  | Echo (front)
-static constexpr uint8_t PIN_TRIG_LEFT_2 = 12; // GP12 = Pin 18  | Trigger (rear)
-static constexpr uint8_t PIN_ECHO_LEFT_2 = 13; // GP13 = Pin 19  | Echo (rear)
+static constexpr uint8_t PIN_TRIG_LEFT_1 = 16;
+static constexpr uint8_t PIN_ECHO_LEFT_1 = 17; // GP11 = Pin 17  | Echo (front)
+static constexpr uint8_t PIN_TRIG_LEFT_2 = 18; // GP12 = Pin 18  | Trigger (rear)
+static constexpr uint8_t PIN_ECHO_LEFT_2 = 19; // GP13 = Pin 19  | Echo (rear)
 
 // --- 右側感測器（面向右方）---
-static constexpr uint8_t PIN_TRIG_RIGHT_1 = 14; // GP14 = Pin 20  | Trigger (front)
-static constexpr uint8_t PIN_ECHO_RIGHT_1 = 15; // GP15 = Pin 21  | Echo (front)
-static constexpr uint8_t PIN_TRIG_RIGHT_2 = 16; // GP16 = Pin 22  | Trigger (rear)
-static constexpr uint8_t PIN_ECHO_RIGHT_2 = 17; // GP17 = Pin 23  | Echo (rear)
+static constexpr uint8_t PIN_TRIG_RIGHT_1 = 6;  // GP14 = Pin 20  | Trigger (front)
+static constexpr uint8_t PIN_ECHO_RIGHT_1 = 7;  // GP15 = Pin 21  | Echo (front)
+static constexpr uint8_t PIN_TRIG_RIGHT_2 = 10; // GP16 = Pin 22  | Trigger (rear)
+static constexpr uint8_t PIN_ECHO_RIGHT_2 = 11; // GP17 = Pin 23  | Echo (rear)
 
 // ============================================================================
 // 感測器索引列舉與分組

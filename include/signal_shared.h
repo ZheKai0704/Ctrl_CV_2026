@@ -459,6 +459,35 @@ inline uint16_t calculateCrc(const uint8_t *data, size_t len) {
     return crc;
 }
 
+// 遙測封包收尾：一次填好標頭（sync / msgType / frameSeq / targetID）＋時間戳
+// ＋CRC16（計算範圍不含 crc16 自身）。
+//
+// 為什麼需要：Move / Shoot / Storage 的 buildTelemetry() 都手寫同樣 6 行標頭與
+// CRC，只要漏填 sync 或忘記算 CRC，Hub 端就會整包丟棄（序列監控只看到
+// "CRC mismatch"，該節點完全隱形）。集中成一個 inline 函式避免漏填。
+//
+// ⚠ timestamp 由呼叫端傳入（多數節點是 time_us_64() & 0xFFFFFFFF）：本檔不依賴
+//   pico/Arduino 的時間函式，超音波等獨立節點也能共用此標頭。
+//
+// ⚠ frameSeq 注意：本函式填的 frameSeq 不會出現在實際上線的封包裡。
+//   ChassisComms::sendTelemetry() 送出前會整組重新戳記
+//   sync / msgType / frameSeq / targetID / crc16（見 lib/ChassisComms/ChassisComms.cpp），
+//   線路上的序號由 ChassisComms 內部的 telemetrySeq 遞增。也就是說呼叫端
+//   傳進來的 frameSeq 只是「填滿欄位」用，不影響去重/排序；真正生效的是
+//   ChassisComms 的序號。若日後要自己控制序號，必須改 sendTelemetry()，
+//   改這裡沒用。
+inline void finalizeTelemetry(MoveTelemetry &tm, uint8_t frameSeq,
+                              uint32_t timestampUs) {
+    tm.sync = 0xA5;
+    tm.msgType = MsgType::TELEMETRY;
+    tm.frameSeq = frameSeq;
+    tm.targetID = TargetID::HUB;
+    tm.timestamp = timestampUs;
+    tm.crc16 = 0; // 先歸零，CRC 才不會把自己的殘值算進去
+    tm.crc16 = calculateCrc(reinterpret_cast<const uint8_t *>(&tm),
+                            sizeof(MoveTelemetry) - 2);
+}
+
 // COBS 編碼：回傳編碼後的位元組數。
 // dst 至少需 len + len / 254 + 2 個位元組。
 inline size_t cobsEncode(const uint8_t *src, size_t len, uint8_t *dst) {

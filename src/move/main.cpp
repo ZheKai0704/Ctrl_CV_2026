@@ -22,7 +22,11 @@
 // ============================================================================
 #include "SlaveComms.h"
 #include "quad_phase.pio.h"
+#include <AdaptiveFeedforward.h>
 #include <Arduino.h>
+#include <DebugFmt.h>
+#include <MotionProfile.h>
+#include <StatusLed.h>
 #include <cmath>
 #include <hardware/gpio.h>
 #include <hardware/pio.h>
@@ -154,14 +158,10 @@ constexpr float B_MAX = 15.0f;
 } // namespace RlsCfg
 
 // 每輪 RLS 狀態（靜態分配；[FL, FR, BL, BR]）。
-struct RlsState {
-    float a = 33.0f; // 增益 duty%/RPS（開機由 setup 以 kPidCfg.ff 覆寫）
-    float b = 0.0f;  // 保留欄位，單一參數模型下恆為 0
-    float P00 = RlsCfg::P_INIT; // 純量 RLS 協方差
-    float P01 = 0.0f; // 保留欄位（不再使用）
-    float P11 = RlsCfg::P_INIT;
-};
+//   演算法本體（update / feedforward）在 AdaptiveFeedforward.h（純數學），
+//   本檔只保留調參（RlsCfg）與狀態；RlsCfg 於 setup() 組成 rlsCfg 傳入。
 static RlsState rls[4];
+static RlsConfig rlsCfg; // setup() 由 RlsCfg 填入，之後唯讀
 
 // ============================================================================
 // 四輪閉迴路 PID 參數（由實測綁 PIO 架構依序調出；單位 duty% per
@@ -205,51 +205,9 @@ static const int8_t kAxisForwardPolarity = -1;
 //     起步（從 0）→ 慢段小坡克服靜摩擦 → 中段加速 → 平滑到位
 //     減速（往 0）→ 快速但 Jerk 限幅、不瞬停
 //   穩態追蹤時 y==target（無誤差、無積分風扇）；僅在目標改變時作用。
+//   演算法本體在 MotionProfile.h（純數學，不含車體常數）；MoveCfg::SCURVE_*
+//   的調參值於 setup() 以 configure() 傳入。
 // ============================================================================
-struct SCurveRamp {
-    float y = 0.f;     // 平滑後指令輸出（此軸）
-    float accel = 0.f; // 目前加速度（RPS/s）
-
-    // 更新並回傳平滑後輸出（一行呼叫）
-    float updatePw(float target, float dt) {
-        update(target, dt);
-        return y;
-    }
-
-    // 每控制週期呼叫，把 y 往 target 平滑推進
-    void update(float target, float dt) {
-        float err = target - y;
-        if(fabsf(err) < MoveCfg::SCURVE_SETTLE_TOL) {
-            y = target;
-            accel = 0.f;
-            return;
-        }
-        // 判斷加/減速：目標比目前更靠近 0 → 減速（快速，且維持方向）
-        const bool decel = (y != 0.f) && ((err > 0.f) != (y > 0.f));
-        float cap = decel ? MoveCfg::SCURVE_DECEL : MoveCfg::SCURVE_ACCEL;
-        // 起步慢段：從 0 出發且速度尚小 → 限加速度以小斜率起步克服靜摩擦
-        if(!decel && fabsf(y) < MoveCfg::SCURVE_START_SLOW_VEL)
-            cap = (cap < MoveCfg::SCURVE_START_ACCEL)
-                      ? cap
-                      : MoveCfg::SCURVE_START_ACCEL;
-
-        // Jerk 限幅：加速度以 kJerk 斜率往目標 cap 逼近 → S 形圓角
-        const float aim = (err > 0.f) ? cap : -cap;
-        const float maxDa = MoveCfg::SCURVE_JERK * dt;
-        float da = aim - accel;
-        if(da > maxDa)
-            da = maxDa;
-        if(da < -maxDa)
-            da = -maxDa;
-        accel += da;
-
-        y += accel * dt;
-
-        // 防止越過目標（overshoot）：越過即鎖定在 target
-        if((y - target) * err < 0.f)
-            y = target;
-    }
-};
 static SCurveRamp rampVx, rampVy, rampOmega; // 車身三軸各一套
 
 // ============================================================================
@@ -383,47 +341,8 @@ static volatile float dbg_outDuty0 = 0.0f; // FL(輪0) 實際輸出 duty%
 static uint8_t tmFrameSeq = 0;             // 遙測幀序號（Core 1 遞增）
 
 // 本 core 的 printf / Serial.printf 不支援 %f（會印成空白），
-// 因此序列監控一律用 ×100 整數輸出（vx/vy/omega/RPS = x0.01）。
-static int scaled100(float v) {
-    if(!std::isfinite(v))
-        return 0;
-    return static_cast<int>(v * 100.0f);
-}
-
-// 對 clamped float 值做上下限（靜態函式，無動態分配）。
-static float clampf(float v, float lo, float hi) {
-    if(v < lo)
-        return lo;
-    if(v > hi)
-        return hi;
-    return v;
-}
-
-// RLS 更新：餵入一筆 (rps, duty)，更新單一增益 a（b 固定 0）。
-//   原本用 2 參數 (a, b) 模型 duty ≈ a*rps + b：等速時 φ=[rps,1] 幾乎共線，
-//   (a,b) 無法辨識，會沿 null 方向亂飄（實測 a 在 0~30、b 在 ±15 間跳動），
-//   前饋因此失準，閉迴路長期追不到目標。改成單一增益模型後可辨識且穩定。
-static void rlsUpdate(RlsState &s, float rps, float duty) {
-    if(fabsf(rps) < RlsCfg::MIN_SPEED_RPS)
-        return;
-    s.b = 0.0f;
-    const float pred = s.a * rps;
-    const float err = duty - pred;
-
-    // 純量 RLS：K = P*rps / (λ + rps²*P)
-    const float Pphi = s.P00 * rps;
-    const float denom = RlsCfg::LAMBDA + rps * Pphi;
-    if(fabsf(denom) < 1e-6f) // 數值退化防護
-        return;
-    const float K = Pphi / denom;
-
-    s.a += K * err;
-    s.P00 = clampf((s.P00 - K * Pphi) / RlsCfg::LAMBDA, RlsCfg::P_MIN,
-                   RlsCfg::P_MAX);
-    s.P01 = 0.0f; // 2×2 結構保留但不再使用
-    s.P11 = RlsCfg::P_MIN;
-    s.a = clampf(s.a, RlsCfg::A_MIN, RlsCfg::A_MAX);
-}
+// 因此序列監控一律用 ×100 整數輸出（vx/vy/omega/RPS = x0.01，
+// 實作見 DebugFmt::scaled100）。
 
 // ============================================================================
 // 硬體 PWM 輸出 + DIR（對齊 motor.h 行為）
@@ -602,7 +521,8 @@ static void onMoveCommand(const ChassisSnapshot &cmd) {
         // 前饋：方案 A 以 線上 RLS 自適應模型 (a*targetRps + b) 取代固定 pid.ff。
         //   a = 逆增益（自動適應電池電壓），b = 庫倫摩擦截距（自動適應地板）。
         const WheelPidCfg &pid = kPidCfg[i];
-        const float ff = rls[i].a * targetRps[i] + rls[i].b; // 自適應前饋 (duty%)
+        const float ff =
+            AdaptiveFeedforward::feedforward(rls[i], targetRps[i]); // 自適應前饋 (duty%)
         const float p = pid.kP * err;
 
         // 積分上下限隨指令縮放：只讓積分補足「命令前饋出力以下」的誤差。
@@ -665,7 +585,7 @@ static void onMoveCommand(const ChassisSnapshot &cmd) {
         if(settled) {
             // 以「實際應用 duty」為目標、量測轉速為輸入 → 學得真正
             //   逆增益「duty→轉速」映射（含 PI 已補足的殘餘摩擦）。
-            rlsUpdate(rls[i], w.measRps, applied);
+            AdaptiveFeedforward::update(rls[i], rlsCfg, w.measRps, applied);
         }
     }
     dbg_measRps = wheels[0].measRps;
@@ -681,19 +601,14 @@ static void onMoveCommand(const ChassisSnapshot &cmd) {
     tm.cmdVx = rVx;
     tm.cmdVy = rVy;
     tm.cmdOmega = rOmega;
-    tm.mode = (uint8_t)RobotMode::AUTO;
+    tm.mode = static_cast<uint8_t>(RobotMode::AUTO);
     tm.estopFlag = 0;
-    tm.timestamp = (uint32_t)(nowUs & 0xFFFFFFFFULL);
-    // ⚠ 遙測標頭 + CRC 必須填寫，否則 Hub 端 CRC 驗證失敗會整包丟棄
-    //   （序列監控會一直印 "CRC mismatch"，Move 的狀態完全看不到）。
-    //   注意：CRC 計算範圍不含 crc16 自身。
-    tm.sync = 0xA5;
-    tm.msgType = MsgType::TELEMETRY;
-    tm.frameSeq = tmFrameSeq++;
-    tm.targetID = TargetID::HUB;
-    tm.crc16 = 0;
-    tm.crc16 = SignalUtils::calculateCrc(
-        reinterpret_cast<const uint8_t *>(&tm), sizeof(MoveTelemetry) - 2);
+    // ⚠ 遙測標頭（sync/msgType/frameSeq/targetID）、timestamp 與 CRC 由
+    //   SignalUtils::finalizeTelemetry 統一填寫；手寫漏填 sync 或 CRC 會讓
+    //   Hub 端驗證失敗而整包丟棄（序列監控只看到 "CRC mismatch"）。
+    //   CRC 計算範圍不含 crc16 自身；timestamp 維持 us 計時的低 32 bits。
+    SignalUtils::finalizeTelemetry(
+        tm, tmFrameSeq++, static_cast<uint32_t>(nowUs & 0xFFFFFFFFULL));
     slave.prepareTelemetry(tm);
 }
 
@@ -703,9 +618,9 @@ static void onMoveCommand(const ChassisSnapshot &cmd) {
 static void onMoveEstop() {
     // S 曲線也一併歸零：若停留在舊速度，E-Stop 解除後的第一個命令
     //   會直接以舊斜率／舊速度餵 PID → 瞬間大出力（暴衝）。
-    rampVx = SCurveRamp();
-    rampVy = SCurveRamp();
-    rampOmega = SCurveRamp();
+    rampVx.reset();
+    rampVy.reset();
+    rampOmega.reset();
 
     for(int i = 0; i < 4; i++) {
         wheels[i].targetDuty = 0.0f;
@@ -758,6 +673,19 @@ constexpr uint32_t IDLE_OFF_MS = 1500;
 
 enum class LedState : uint8_t { BOOT = 0, IDLE = 1, ACTIVE = 2 };
 
+// 亮滅圖樣表：索引 = LedState 的數值（相位推進交給 StatusLed）
+//   BOOT   → 長亮（剛開機、從未收到有效幀）
+//   IDLE   → 0.5Hz 慢閃，鎮定不擾人
+//   ACTIVE → 1Hz 短脈衝心跳（像路由器資料燈）
+static const StatusLed::Pattern kLedPatterns[] = {
+    {0, 0, true},                                         // BOOT：長亮
+    {LedCfg::IDLE_ON_MS, LedCfg::IDLE_OFF_MS, false},     // IDLE
+    {LedCfg::ACTIVE_ON_MS, LedCfg::ACTIVE_OFF_MS, false}, // ACTIVE
+};
+static constexpr uint8_t LED_PATTERN_COUNT =
+    static_cast<uint8_t>(sizeof(kLedPatterns) / sizeof(kLedPatterns[0]));
+static StatusLed statusLed(LED_BUILTIN, kLedPatterns, LED_PATTERN_COUNT);
+
 static const char *ledStateName(LedState st) {
     switch(st) {
     case LedState::BOOT:
@@ -781,43 +709,12 @@ static LedState currentLedState() {
 }
 
 static void updateStatusLed() {
-    static LedState lastState = LedState::BOOT;
-    static bool ledOn = false;
-    static uint32_t phaseStartMs = 0;
+    const uint8_t st = static_cast<uint8_t>(currentLedState());
+    dbg_ledState = st; // 除錯輸出與 LED 實際套用的狀態一致
 
-    const LedState st = currentLedState();
-    const uint32_t now = millis();
-
-    dbg_ledState = static_cast<uint8_t>(st);
-
-    // 狀態切換 → 重置相位並立刻點亮（先給一個脈衝，新狀態立即可見）
-    if(st != lastState) {
-        lastState = st;
-        phaseStartMs = now;
-        ledOn = true;
-        digitalWrite(LED_BUILTIN, HIGH);
-    }
-
-    // 未連線 / 剛開機 → 長亮（含 E-Stop 逾時狀態）
-    if(st == LedState::BOOT) {
-        digitalWrite(LED_BUILTIN, HIGH);
-        return;
-    }
-
-    uint32_t onMs = LedCfg::ACTIVE_ON_MS;
-    uint32_t offMs = LedCfg::ACTIVE_OFF_MS;
-    if(st == LedState::IDLE) {
-        onMs = LedCfg::IDLE_ON_MS;
-        offMs = LedCfg::IDLE_OFF_MS;
-    }
-
-    // 非阻塞相位推進：亮滿 onMs → 熄，熄滿 offMs → 亮
-    const uint32_t phaseMs = ledOn ? onMs : offMs;
-    if(now - phaseStartMs >= phaseMs) {
-        phaseStartMs = now;
-        ledOn = !ledOn;
-        digitalWrite(LED_BUILTIN, ledOn ? HIGH : LOW);
-    }
+    // 狀態切換 → 重置相位並立刻點亮；長亮狀態持續 HIGH；其餘亮滿
+    // onMs 熄、熄滿 offMs 亮（非阻塞，見 StatusLed::update）。
+    statusLed.update(st, millis());
 }
 
 // ============================================================================
@@ -831,8 +728,36 @@ void setup() {
     //   還是 0），就可能出現開機暴衝。因此先鎖定馬達腳位再開始其他的初始化。
     initMotorHardware();
 
-    pinMode(LED_BUILTIN, OUTPUT);
-    digitalWrite(LED_BUILTIN, LOW);
+    // 車身 S 曲線調參（MoveCfg::SCURVE_*）→ MotionProfile::SCurveRamp。
+    //   必須早於第一個控制幀（slave.begin() 之後 Core 1 才可能執行
+    //   onMoveCommand）；未 configure 時輸出會卡住不動。
+    const SCurveConfig sCurveCfg = {
+        MoveCfg::SCURVE_ACCEL,
+        MoveCfg::SCURVE_DECEL,
+        MoveCfg::SCURVE_JERK,
+        MoveCfg::SCURVE_START_SLOW_VEL,
+        MoveCfg::SCURVE_START_ACCEL,
+        MoveCfg::SCURVE_SETTLE_TOL,
+    };
+    rampVx.configure(sCurveCfg);
+    rampVy.configure(sCurveCfg);
+    rampOmega.configure(sCurveCfg);
+
+    // RLS 調參（RlsCfg）→ AdaptiveFeedforward::RlsConfig
+    rlsCfg = RlsConfig{
+        RlsCfg::LAMBDA,
+        RlsCfg::P_INIT,
+        RlsCfg::P_MIN,
+        RlsCfg::P_MAX,
+        RlsCfg::MIN_SPEED_RPS,
+        RlsCfg::SETTLE_TOL_RPS,
+        RlsCfg::A_MIN,
+        RlsCfg::A_MAX,
+        RlsCfg::B_MIN,
+        RlsCfg::B_MAX,
+    };
+
+    statusLed.begin();
 
     // 方案 A：RLS 初始增益以現有固定 ff 作為種子（無縫接軌，
     //   開機即擁有與原本固定 FF 相同的行為，再由 RLS 逐步微調）。
@@ -881,23 +806,23 @@ void loop() {
                           timeoutDriven ? "cmd timeout, no data" : "hub estop");
         } else {
             Serial.printf("[MOVE] vx=%+d vy=%+d omega=%+d x0.01\n",
-                          scaled100(dbg_vx), scaled100(dbg_vy),
-                          scaled100(dbg_omega));
+                          DebugFmt::scaled100(dbg_vx), DebugFmt::scaled100(dbg_vy),
+                          DebugFmt::scaled100(dbg_omega));
             Serial.printf("[MOVE] FL=%+d/%+d FR=%+d/%+d x0.01,%%\n",
-                          scaled100(wheels[0].measRps),
+                          DebugFmt::scaled100(wheels[0].measRps),
                           static_cast<int>(wheels[0].outDuty),
-                          scaled100(wheels[1].measRps),
+                          DebugFmt::scaled100(wheels[1].measRps),
                           static_cast<int>(wheels[1].outDuty));
             Serial.printf("[MOVE] BL=%+d/%+d BR=%+d/%+d x0.01,%%\n",
-                          scaled100(wheels[2].measRps),
+                          DebugFmt::scaled100(wheels[2].measRps),
                           static_cast<int>(wheels[2].outDuty),
-                          scaled100(wheels[3].measRps),
+                          DebugFmt::scaled100(wheels[3].measRps),
                           static_cast<int>(wheels[3].outDuty));
             // 方案 A：RLS 自適應 FF 係數（觀察學習狀態）
             //   a = 增益(duty%/RPS)，b = 庫倫摩擦截距(duty%)
             Serial.printf("[MOVE] RLS a=[%d %d %d %d] x0.01\n",
-                          scaled100(rls[0].a), scaled100(rls[1].a),
-                          scaled100(rls[2].a), scaled100(rls[3].a));
+                          DebugFmt::scaled100(rls[0].a), DebugFmt::scaled100(rls[1].a),
+                          DebugFmt::scaled100(rls[2].a), DebugFmt::scaled100(rls[3].a));
         }
     }
 }

@@ -44,3 +44,23 @@ libraries by scanning project source files.
 
 More information about PlatformIO Library Dependency Finder
 - https://docs.platformio.org/page/librarymanager/ldf.html
+
+------------------------------------------------------------------------
+本專案的私有模組（皆為 header-only，`lib_ldf_mode = deep+` 自動連結）
+------------------------------------------------------------------------
+
+ChassisComms        COBS + Binary struct + CRC16 收發（控制幀 / 遙測 / 心跳），綁定任意 Stream
+CrsfReceiver        CRSF 遙控接收機解包（Hub Core 1 專用）
+SlaveComms          Slave 雙核框架：UART0 收幀 → atomic 交棒 Core 1 → 馬達回呼 + 逾時 E-Stop
+
+DebugFmt            序列監控的數值輸出（scaled100 ×100 整數、printFixed 整數手法，不用 %f）
+MathUtils           clampf / deadband / sanitizePercent / isFiniteF 等無狀態純量工具
+StatusLed           非阻塞相位 LED 狀態機（各 main 保留自己的 LedState 判定與 Pattern 表）
+SlaveLog            Core 1 → Core 0 的環形文字日誌（SPSC + release/acquire，避免 Core 1 直接 Serial 阻塞）
+                    目前只有 storage 使用；shoot/move 的 Serial 呼叫都在 loop()（Core 0），暫不需要
+Pca9685             PCA9685 16 通道 PWM 低階 I2C 驅動（重試 + bus recovery + 50Hz prescale）
+EepromStore         EEPROM 上的 magic + checksum 版面驗證存取、抹除態 NaN 歸零
+                    （load/sanitizeFloat 已在用；save/checksum32 尚無呼叫者，保留給後續節點）
+MotionProfile       jerk-limited S 曲線速度剖面（SCurveRamp；調參由呼叫端 configure()）
+MotionProfile/PioStepRate.h  PIO 步進速率 → clkdiv 換算
+AdaptiveFeedforward 線上自適應前饋（單參數 RLS：duty ≈ a*rps）

@@ -51,7 +51,12 @@
 #include "ChassisComms.h"
 #include <Arduino.h>
 #include <CrsfReceiver.h>
+#include <MathUtils.h>
 #include <SerialPIO.h>
+#include <StatusLed.h>
+#include <cmath>         // lroundf / fabsf
+#include <cstring>       // memcpy
+#include <pico/stdlib.h> // time_us_64()
 
 // ============================================================================
 // 跨核心共用變數 — Core 1 寫入，Core 0 讀取
@@ -132,41 +137,6 @@ static uint64_t lastStorageTmUs = 0;
 static constexpr uint64_t SLAVE_TELEMETRY_TIMEOUT_US = 500000ULL; // 500ms
 
 // ============================================================================
-// 輔助函式：COBS 解碼（inline，從原始 COBS 位元組流解碼）
-// 回傳解碼後的位元組數，失敗回傳 0。
-// ============================================================================
-static size_t cobsDecodeInline(const uint8_t *src, size_t len, uint8_t *dst,
-                               size_t dstSize) {
-    size_t readIdx = 0;
-    size_t writeIdx = 0;
-
-    while(readIdx < len) {
-        uint8_t code = src[readIdx];
-        size_t blockLen = static_cast<size_t>(code);
-
-        // 來源位元組不足
-        if(readIdx + blockLen > len)
-            return 0;
-        readIdx++;
-
-        // 目的溢位
-        if(writeIdx + (blockLen - 1) > dstSize)
-            return 0;
-
-        for(uint8_t i = 1; i < code; i++)
-            dst[writeIdx++] = src[readIdx++];
-
-        // 插入隱含的零值（非最後區塊）
-        if(code < 0xFF && readIdx < len) {
-            if(writeIdx >= dstSize)
-                return 0;
-            dst[writeIdx++] = 0x00;
-        }
-    }
-    return writeIdx;
-}
-
-// ============================================================================
 // 輔助函式：處理 PIO UART RX 收到的位元組
 //
 // 從指定 SerialPIO 讀取可用位元組，暫存至對應的 PioRxBuffer。
@@ -191,10 +161,10 @@ static void processPioRx(SerialPIO &uart, PioRxBuffer &rxBuf, const char *name,
 
             const uint64_t nowUs = time_us_64();
 
-            // COBS 解碼
-            uint8_t decoded[512];
-            size_t decodedLen = cobsDecodeInline(rxBuf.buf, rxBuf.len, decoded,
-                                                 sizeof(decoded));
+            // COBS 解碼（共用版上限 COBS_DST_MAX = 512，與本緩衝區同尺寸）
+            uint8_t decoded[SignalUtils::COBS_DST_MAX];
+            size_t decodedLen =
+                SignalUtils::cobsDecode(rxBuf.buf, rxBuf.len, decoded);
 
             if(decodedLen == 0) {
                 if(HUB_LOG_VERBOSE && nowUs - rxBuf.lastLogUs > 500000ULL) {
@@ -405,20 +375,27 @@ static ControlSource gSource = ControlSource::JETSON;
 namespace LedCfg {
 // 視為「資料通訊中」的視窗（略大於典型控制週期，避免閃斷）
 constexpr uint32_t ACTIVE_TIMEOUT_MS = 150;
-
-// 已連線 + 資料通訊中：1Hz 短脈衝心跳（像路由器資料燈）
-constexpr uint32_t ACTIVE_ON_MS = 80;
-constexpr uint32_t ACTIVE_OFF_MS = 920;
-
-// 已連線但 Idle：0.5Hz 慢閃，鎮定不擾人
-constexpr uint32_t IDLE_ON_MS = 500;
-constexpr uint32_t IDLE_OFF_MS = 1500;
 } // namespace LedCfg
 
 enum class LedState : uint8_t { BOOT = 0,
                                 ESTOP = 1,
                                 IDLE = 2,
                                 ACTIVE = 3 };
+
+// 亮滅圖樣表：索引 = LedState 的數值（相位推進交給 StatusLed）
+//   BOOT   → 長亮（剛開機、從未收到 Jetson 幀）
+//   ESTOP  → 長亮（Jetson 逾時且 RC Failsafe）
+//   IDLE   → 0.5Hz 慢閃，鎮定不擾人
+//   ACTIVE → 1Hz 短脈衝心跳（像路由器資料燈）
+static const StatusLed::Pattern kLedPatterns[] = {
+    {0, 0, true},       // BOOT：長亮
+    {0, 0, true},       // ESTOP：長亮
+    {500, 1500, false}, // IDLE：亮 500ms / 熄 1500ms
+    {80, 920, false},   // ACTIVE：亮 80ms / 熄 920ms
+};
+static constexpr uint8_t LED_PATTERN_COUNT =
+    static_cast<uint8_t>(sizeof(kLedPatterns) / sizeof(kLedPatterns[0]));
+static StatusLed statusLed(LED_BUILTIN, kLedPatterns, LED_PATTERN_COUNT);
 
 static LedState currentLedState() {
     if(jetsonFrameCount == 0)
@@ -432,41 +409,7 @@ static LedState currentLedState() {
 }
 
 static void updateStatusLed() {
-    static LedState lastState = LedState::BOOT;
-    static bool ledOn = false;
-    static uint32_t phaseStartMs = 0;
-
-    const LedState st = currentLedState();
-    const uint32_t now = millis();
-
-    // 狀態切換 → 重置相位並立刻點亮（新狀態立即可見）
-    if(st != lastState) {
-        lastState = st;
-        phaseStartMs = now;
-        ledOn = true;
-        digitalWrite(LED_BUILTIN, HIGH);
-    }
-
-    // 未連線 / 剛開機 / E-Stop → 長亮
-    if(st == LedState::BOOT || st == LedState::ESTOP) {
-        digitalWrite(LED_BUILTIN, HIGH);
-        return;
-    }
-
-    uint32_t onMs = LedCfg::ACTIVE_ON_MS;
-    uint32_t offMs = LedCfg::ACTIVE_OFF_MS;
-    if(st == LedState::IDLE) {
-        onMs = LedCfg::IDLE_ON_MS;
-        offMs = LedCfg::IDLE_OFF_MS;
-    }
-
-    // 非阻塞相位推進：亮滿 onMs → 熄，熄滿 offMs → 亮
-    const uint32_t phaseMs = ledOn ? onMs : offMs;
-    if(now - phaseStartMs >= phaseMs) {
-        phaseStartMs = now;
-        ledOn = !ledOn;
-        digitalWrite(LED_BUILTIN, ledOn ? HIGH : LOW);
-    }
+    statusLed.update(static_cast<uint8_t>(currentLedState()), millis());
 }
 
 // ============================================================================
@@ -516,16 +459,17 @@ static void forwardAllSlaves(const ControlPacket &pkt) {
 //     若只拿來微調上下射轉速，請把 OMEGA 改成另一個空通道。
 // ============================================================================
 
-// 死區濾波：-10~10 → 0
-static int16_t applyDeadband(int16_t val) {
-    if(val > -10 && val < 10)
-        return 0;
-    return val;
-}
+// 死區門檻（單一來源）：rc_channels[] 是 -100~100 的整數刻度。
+// RcMoveCfg::DEADBAND（float 刻度）由這個值推導，兩者永遠一致
+// （rcAxisToWire 同時用到 int 與 float 兩種型別）。
+// 邊界語意：MathUtils::deadband 用嚴格不等式（|v| < db → 0），
+// 所以 -10 / +10 仍是有效值，-9 / +9 才是 0。
+static constexpr int16_t RC_DEADBAND = 10;
 
 // 將 rc_channels[] 值映射為 int8（含死區 + 限幅）
 static int8_t rcToInt8(int16_t rcVal) {
-    return static_cast<int8_t>(constrain(applyDeadband(rcVal), -100, 100));
+    return static_cast<int8_t>(
+        constrain(MathUtils::deadband(rcVal, RC_DEADBAND), -100, 100));
 }
 
 // ============================================================================
@@ -566,31 +510,27 @@ constexpr int16_t SOURCE_RC_THRESHOLD = -10;
 namespace RcMoveCfg {
 constexpr float FULL_TRANSLATE_RPS = 1.20f; // 前後 / 左右平移滿舵 (RPS)
 constexpr float FULL_OMEGA = 7.00f;         // 旋轉滿舵（firmware omega 刻度）
-constexpr float DEADBAND = 10.0f;           // 與 applyDeadband 相同
+// 死區寬度：直接由 RC_DEADBAND 推導（單一來源，不要在此另寫一個數字，
+// 否則 deadband 的邊界判定與這裡的重映射零點會不一致）
+constexpr float DEADBAND = static_cast<float>(RC_DEADBAND);
 } // namespace RcMoveCfg
 
 // 車身 RPS → int8 線路刻度（Slave 端再乘 MAX_RPS/127）
 static int8_t rpsToWire(float rps) {
-    float wire = rps * 127.0f / RobotConfig::MAX_RPS;
-    if(wire > 127.0f)
-        wire = 127.0f;
-    if(wire < -127.0f)
-        wire = -127.0f;
+    const float wire =
+        MathUtils::clampf(rps * 127.0f / RobotConfig::MAX_RPS, -127.0f, 127.0f);
     return static_cast<int8_t>(lroundf(wire));
 }
 
 // rc_channels[] 值 -100~100 → 線路刻度（死區後 10..100 重新映射 0..100，過死區不跳動）
 //   sign = ±1：實機方向修正（不影響 Jetson 路徑）
 static int8_t rcAxisToWire(int16_t rcVal, float fullRange, int8_t sign = 1) {
-    const float v = static_cast<float>(applyDeadband(rcVal));
+    const float v = static_cast<float>(MathUtils::deadband(rcVal, RC_DEADBAND));
     if(v == 0.0f)
         return 0;
     const float span = 100.0f - RcMoveCfg::DEADBAND;
-    float mag = (fabsf(v) - RcMoveCfg::DEADBAND) / span;
-    if(mag < 0.0f)
-        mag = 0.0f;
-    if(mag > 1.0f)
-        mag = 1.0f;
+    const float mag = MathUtils::clampf(
+        (fabsf(v) - RcMoveCfg::DEADBAND) / span, 0.0f, 1.0f);
     return rpsToWire((v > 0.0f ? mag : -mag) * fullRange *
                      static_cast<float>(sign));
 }
@@ -999,8 +939,7 @@ void setup() {
     lastJetsonFrameUs = time_us_64();
 
     // 狀態 LED
-    pinMode(LED_BUILTIN, OUTPUT);
-    digitalWrite(LED_BUILTIN, LOW);
+    statusLed.begin();
 }
 
 // ============================================================================
