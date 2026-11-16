@@ -43,24 +43,35 @@
 //
 // 控制資料 (StoragePayload)：
 //   trigger      (uint8) — 0/1，上緣觸發「全部通道跑一次循環」
+//   row          (int8)  — 水平位置（-97~97）→ STEP/DIR/EN 步進
 //   motorChannel (uint8) — 保留欄位，本版不使用
 //   sw           (uint8) — 保留欄位，本版不使用
 //
 // 硬體配置：
 //   PCA9685: I2C0 (GP4=SDA, GP5=SCL), 位址 0x40, 50Hz
 //   伺服馬達：PCA9685 通道 0~15（實際接了哪幾顆由 EEPROM 的 enabled 決定）
+//   水平步進（移自 Shoot，腳位同 src/test/stepdir_test）：
+//     STEP=GP17（PIO0 SM 產生脈衝）、DIR=GP16、EN=GP18（低電位致能）
+//     行程限制：以 0 步為中間，前 / 後各最多 2400 步（RowStepper::STEP_LIMIT_*）
+//   無刷電調（ESC）：GP13 硬體 PWM 50Hz，1000µs = 0%、2000µs = 100%
+//     本版固定 0%（不轉），見 EscOutput::SPEED_PCT
 //   ※ 本節點已移除 trigger 步進馬達（GP6 未使用；GP4/GP5 現在是 I2C SDA/SCL）
 // ============================================================================
 #include "SlaveComms.h"
+#include "step_pulse.pio.h"
 #include <Arduino.h>
 #include <EEPROM.h>
 #include <EepromStore.h>
 #include <MathUtils.h>
 #include <Pca9685.h>
+#include <PioStepRate.h>
 #include <SlaveLog.h>
 #include <StatusLed.h>
 #include <cmath>
 #include <cstdio>
+#include <hardware/pio.h>
+#include <hardware/clocks.h>
+#include <hardware/pwm.h>
 #include <pico/stdlib.h> // time_us_64()（遙測時間戳）
 
 // ============================================================================
@@ -70,7 +81,64 @@ namespace Pin {
 constexpr uint I2C_SDA = 4;
 constexpr uint I2C_SCL = 5;
 constexpr uint I2C_HZ = 100000;
+
+// ——— 水平 STEP/DIR/EN 步進（腳位同 src/test/stepdir_test） ———
+constexpr uint ROW_STEP = 17; // → 驅動器 PUL（PIO0 SM 產生）
+constexpr uint ROW_DIR = 16;  // → 驅動器 DIR
+constexpr uint ROW_EN = 18;   // → 驅動器 ENA（低電位致能）
+
+// ——— 無刷電調（ESC）油門訊號 ———
+constexpr uint ESC_PWM = 13; // GP13 → ESC 訊號線（硬體 PWM，50Hz）
 } // namespace Pin
+
+// Core 1 → Core 0 除錯日誌（SPSC 佇列）：Core 1 不能直接 Serial，改由 loop() drain 印出
+static SlaveLog storageLog;
+
+// ============================================================================
+// ESC（單向油門）：硬體 PWM 持續送 50Hz 訊號
+//   1000µs = 0%（停轉）、2000µs = 100%
+//   本版 Storage 的 ESC 固定 0%，上電就維持停轉。
+// ============================================================================
+namespace EscOutput {
+constexpr uint32_t TICK_HZ = 1000000; // 1 tick = 1µs
+constexpr uint16_t PWM_WRAP = 19999;  // 20000 ticks = 20ms → 50Hz
+constexpr uint16_t PULSE_ZERO_US = 1000;
+constexpr uint16_t PULSE_FULL_US = 2000;
+constexpr uint8_t SPEED_PCT = 30; // 目前固定速度 0%
+
+static uint16_t pulseUsFor(uint8_t percent) {
+    if(percent > 100) {
+        percent = 100;
+    }
+    return static_cast<uint16_t>(
+        PULSE_ZERO_US +
+        (static_cast<uint32_t>(PULSE_FULL_US - PULSE_ZERO_US) * percent) / 100u);
+}
+
+static void writePulse(uint16_t us) {
+    if(us < PULSE_ZERO_US) {
+        us = PULSE_ZERO_US;
+    }
+    if(us > PULSE_FULL_US) {
+        us = PULSE_FULL_US;
+    }
+    pwm_set_gpio_level(Pin::ESC_PWM, us); // level = 高電位 tick 數 = µs
+}
+
+void init(uint8_t percent) {
+    gpio_set_function(Pin::ESC_PWM, GPIO_FUNC_PWM);
+    const float div = static_cast<float>(clock_get_hz(clk_sys)) /
+                      static_cast<float>(TICK_HZ);
+    pwm_config cfg = pwm_get_default_config();
+    pwm_config_set_clkdiv(&cfg, div);
+    pwm_config_set_wrap(&cfg, PWM_WRAP);
+    const uint slice = pwm_gpio_to_slice_num(Pin::ESC_PWM);
+    pwm_init(slice, &cfg, true);
+    writePulse(pulseUsFor(percent));
+}
+
+void setPercent(uint8_t percent) { writePulse(pulseUsFor(percent)); }
+} // namespace EscOutput
 
 // PCA9685 暫存器 / 時序常數集中在 lib/Pca9685（Pca9685Reg），
 // 本檔只保留機構層：腳位、校正、序列。
@@ -359,16 +427,6 @@ static bool channelEnabledInEeprom(uint8_t ch) {
 }
 
 // ============================================================================
-// Core 1 → Core 0 日誌（lib/SlaveLog 的環形佇列，本檔持有唯一實例）
-//
-// ⚠ AGENTS.md 規定 Serial 只給 Core 0。Core 1 直接 Serial.printf() 在 USB CDC
-//    TX FIFO 滿時會阻塞（實測最長 1 秒），會把機構序列卡在半途、看起來像
-//    「seq=RUN 但馬達不動」。因此 Core 1 只把短字串丟進環形佇列，
-//    由 Core 0 的 loop() 統一把它印出來（drain(Serial)）。
-// ============================================================================
-static SlaveLog storageLog;
-
-// ============================================================================
 // 機構序列（非阻塞狀態機，全部在 Core 1 執行）
 //
 //   每收到一次 trigger 上緣只做「一個動作」，做完就停，等下一次 trigger。
@@ -466,21 +524,12 @@ static bool buildAction(uint8_t group) {
 /// 可重複呼叫：已經全在 HOME 就不再寫 I2C（避免 E-Stop 每圈洪水）。
 /// @param force true = 不管 atHome 旗標，一律重寫一次待機位置
 static void stop(bool force = false) {
-    const bool wasRunning = running || postPending;
     running = false;
     postPending = false;
     postStep = 0;
     phase = PHASE_NONE;
     if(force || !atHome)
         goHomeAll(); // 全部回各自待機角度
-    if(wasRunning) {
-        // E-Stop / 停止：主序列全部回各自待機角度，追加那顆也回自己的待機角度
-        const int32_t p =
-            static_cast<int32_t>(lroundf(SeqCfg::restDeg(SeqCfg::POST_CHANNEL) * 10.0f));
-        storageLog.printf("[STORAGE][SEQ] 停止，全部回各自待機角度，CH%u 停在 %ld.%u°",
-                          static_cast<unsigned>(SeqCfg::POST_CHANNEL),
-                          static_cast<long>(p / 10), static_cast<unsigned>(p % 10));
-    }
 }
 
 /// 把本動作會用到的通道放回各自待機角度（不動已維持開啟的其他組）
@@ -513,27 +562,11 @@ static void startNext() {
             phase = PHASE_OUT;
             phaseMs = millis();
             cycleStartMs = phaseMs;
-            // 一行把「第幾動 + 組 + 次數 + 通道」寫進佇列，由 Core 0 印出
-            char line[SlaveLog::LINE_LEN];
-            int n = snprintf(line, sizeof(line),
-                             "[STORAGE][SEQ] 第 %u/%u 動：g%u %u/%u，通道",
-                             static_cast<unsigned>(action + 1),
-                             static_cast<unsigned>(SeqCfg::ACTION_COUNT),
-                             static_cast<unsigned>(group),
-                             static_cast<unsigned>(currentRep),
-                             static_cast<unsigned>(SeqCfg::REPEAT_PER_GROUP));
-            for(uint8_t i = 0; i < stepCount && n > 0 &&
-                               n < static_cast<int>(sizeof(line));
-                i++)
-                n += snprintf(line + n, sizeof(line) - static_cast<size_t>(n),
-                              " CH%u", steps[i]);
-            storageLog.push(line);
             return;
         }
         action = static_cast<uint8_t>((action + 1) % SeqCfg::ACTION_COUNT);
     }
     nextAction = 0;
-    storageLog.push("[STORAGE][SEQ] 沒有已啟用的通道（EEPROM 校正全部關閉）");
 }
 
 /// 主序列做完後的追加動作：CH6 待機角度 → 作動角度，停留後再回待機角度
@@ -549,13 +582,6 @@ static void startPost(uint32_t now) {
     running = true;
     phase = PHASE_NONE;
     phaseMs = now;
-    storageLog.printf("[STORAGE][SEQ] 追加：CH%u → %u°（停留 %lums 後回 %u°）",
-                      static_cast<unsigned>(SeqCfg::POST_CHANNEL),
-                      static_cast<unsigned>(
-                          lroundf(SeqCfg::activeDeg(SeqCfg::POST_CHANNEL))),
-                      static_cast<unsigned long>(SeqCfg::POST_DWELL_MS),
-                      static_cast<unsigned>(
-                          lroundf(SeqCfg::restDeg(SeqCfg::POST_CHANNEL))));
 }
 
 /// 追加動作狀態機（idleHook 呼叫）
@@ -567,20 +593,12 @@ static void updatePost(uint32_t now) {
             writeErrors++;
         postStep = 1;
         phaseMs = now;
-        storageLog.printf("[STORAGE][SEQ] 追加：CH%u → %u°（回待機）",
-                          static_cast<unsigned>(SeqCfg::POST_CHANNEL),
-                          static_cast<unsigned>(
-                              lroundf(SeqCfg::restDeg(SeqCfg::POST_CHANNEL))));
         return;
     }
     // postStep == 1：已回待機角度，追加動作結束，等下一個 trigger
     postPending = false;
     running = false;
     phase = PHASE_NONE;
-    storageLog.printf("[STORAGE][SEQ] 追加完成，CH%u 停在 %u°，等下一次 trigger",
-                      static_cast<unsigned>(SeqCfg::POST_CHANNEL),
-                      static_cast<unsigned>(
-                          lroundf(SeqCfg::restDeg(SeqCfg::POST_CHANNEL))));
 }
 
 /// 動作結束：keepOpen = true 代表通道已開到 OUT，不回 HOME
@@ -595,18 +613,7 @@ static void finishAction(bool keepOpen, uint32_t now) {
         homeActionChannels();
     const uint32_t elapsed = now - cycleStartMs;
     if(keepOpen) {
-        storageLog.printf("[STORAGE][SEQ] 第 %u/%u 動完成（%lu ms），g%u 維持開啟，"
-                          "等下一次 trigger",
-                          static_cast<unsigned>(currentAction + 1),
-                          static_cast<unsigned>(SeqCfg::ACTION_COUNT),
-                          static_cast<unsigned long>(elapsed),
-                          static_cast<unsigned>(currentGroup));
     } else {
-        storageLog.printf("[STORAGE][SEQ] 第 %u/%u 動完成（%lu ms），"
-                          "全部回 HOME，等下一次 trigger",
-                          static_cast<unsigned>(currentAction + 1),
-                          static_cast<unsigned>(SeqCfg::ACTION_COUNT),
-                          static_cast<unsigned long>(elapsed));
     }
 }
 
@@ -627,13 +634,6 @@ static void update() {
             writeErrors++;
         atHome = false;
         const int32_t o = static_cast<int32_t>(lroundf(act * 10.0f));
-        storageLog.printf("[STORAGE][SEQ] g%u %u/%u CH%u → %ld.%u° (step %u/%u)",
-                          static_cast<unsigned>(currentGroup),
-                          static_cast<unsigned>(currentRep),
-                          static_cast<unsigned>(SeqCfg::REPEAT_PER_GROUP), ch,
-                          static_cast<long>(o / 10), static_cast<unsigned>(o % 10),
-                          static_cast<unsigned>(stepIdx + 1),
-                          static_cast<unsigned>(stepCount));
         phase = PHASE_DWELL;
         phaseMs = now;
         break;
@@ -645,9 +645,6 @@ static void update() {
             if(!setAngle(ch, rest))
                 writeErrors++;
             const int32_t h = static_cast<int32_t>(lroundf(rest * 10.0f));
-            storageLog.printf("[STORAGE][SEQ] CH%u → %ld.%u°", ch,
-                              static_cast<long>(h / 10),
-                              static_cast<unsigned>(h % 10));
             phase = PHASE_SETTLE;
             phaseMs = now;
         }
@@ -675,12 +672,6 @@ static void update() {
                 writeErrors++;
             atHome = false;
             const int32_t o = static_cast<int32_t>(lroundf(act * 10.0f));
-            storageLog.printf("[STORAGE][SEQ] g%u 最後一輪 CH%u → %ld.%u°"
-                              "（開啟，維持）",
-                              static_cast<unsigned>(currentGroup),
-                              static_cast<unsigned>(steps[i]),
-                              static_cast<long>(o / 10),
-                              static_cast<unsigned>(o % 10));
         }
         finishAction(true, now);
         startPost(now); // 主序列做完 → 追加 CH6 抽動
@@ -843,8 +834,6 @@ static void holdRefresh() {
     lastMs = now;
 
     uint8_t repaired = 0;
-    uint8_t readFail = 0;
-    uint8_t badCh = 0xFF;
     for(uint8_t ch = 0; ch < Pca9685Reg::CHANNEL_COUNT; ch++) {
         if(!chTargetValid[ch])
             continue;
@@ -859,22 +848,10 @@ static void holdRefresh() {
             continue;
         // 重寫（讀回失敗也重寫：可能只是讀被干擾，寫一次不損失）
         (void)sPca.writeChannelCount(ch, want);
-        badCh = ch;
-        if(ok) {
+        if(ok)
             repaired++;
-        } else {
-            readFail++;
-        }
     }
-    if(repaired == 0 && readFail == 0)
-        return;
     sHoldRepaired += repaired;
-    storageLog.printf("[STORAGE][HOLD] 讀回不一致→已重寫 %u 通道（讀回失敗 %u，累計 %lu）"
-                      " 例如 CH%u",
-                      static_cast<unsigned>(repaired),
-                      static_cast<unsigned>(readFail),
-                      static_cast<unsigned long>(sHoldRepaired),
-                      static_cast<unsigned>(badCh));
 }
 
 /// 讀回不一致而重寫的累計次數（給 Core 0 的監控行用：0 = 晶片設定一直正常）
@@ -893,8 +870,6 @@ static void pollPostChannel() {
     bool fullOff = false;
     bool fullOn = false;
     if(!sPca.readChannel(SeqCfg::POST_CHANNEL, off, fullOff, fullOn)) {
-        storageLog.printf("[STORAGE][CH%u] 讀回失敗（I2C 沒 ACK）",
-                          static_cast<unsigned>(SeqCfg::POST_CHANNEL));
         return;
     }
     // 該通道自己的待機 / 作動角度（來自 SeqCfg::PROFILE）
@@ -909,16 +884,251 @@ static void pollPostChannel() {
                      off > wantCount + 4;
     if(!bad)
         return;
-    storageLog.printf("[STORAGE][CH%u] 異常：want %u°=%uµs(count %u)，晶片實測 %uµs"
-                      "(count %u)%s%s",
-                      static_cast<unsigned>(SeqCfg::POST_CHANNEL),
-                      static_cast<unsigned>(wantDeg), static_cast<unsigned>(wantUs),
-                      static_cast<unsigned>(wantCount),
-                      static_cast<unsigned>(actualUs), static_cast<unsigned>(off),
-                      fullOff ? " full-OFF(沒脈衝)" : "",
-                      fullOn ? " full-ON(恆高)" : "");
 }
 } // namespace MotorControl
+
+// ============================================================================
+// 水平步進：STEP 脈衝由 PIO 產生
+//
+// 架構：
+//   PIO0 一個 SM：step_pulse.pio，固定 7 週期/步
+//     f_step = clk_sys / (7 × clkdiv) → 以 clkdiv 調速與加減速
+//   DIR / EN 由 CPU GPIO 控制（DIR 切換後等 20µs）
+//
+// 流程：
+//   1. onCommand → setTarget()（只寫目標步數，不阻塞）
+//   2. Core 1 idleHook → update()：
+//        未動作且目標 ≠ 位置 → 設 DIR、下令 PIO 發 |diff| 個脈衝
+//        動作中 → 依加速度調整 clkdiv；PIO irq 旗標 → 到位
+//   3. E-Stop → abort()：停 SM、STEP 拉低、以估算步數修正位置
+// ============================================================================
+namespace AxisConfig {
+// 輸入範圍：-97 ~ +97（超過限幅，保留機構餘裕）
+constexpr float INPUT_LIMIT = 97.0f;
+} // namespace AxisConfig
+
+namespace RowStepper {
+// 行程限制（步）：0 = 中間位置；正向 = front，負向 = back
+// rc[3] 的 -97~+97 直接線性映射到 -2400~+2400（±97 對應±2400）
+constexpr int32_t STEP_LIMIT_FRONT = 2400;
+constexpr int32_t STEP_LIMIT_BACK = 2400;
+constexpr float STEP_PER_INPUT =
+    static_cast<float>(STEP_LIMIT_FRONT) / AxisConfig::INPUT_LIMIT;
+// 方向：rc 正值 → 正步數（DIR=1）。若實機方向相反改成 -1.0f。
+constexpr float INPUT_SIGN = -1.0f;
+// 速度 / 加速度：
+//   短行程（±2400 步）的實際峰值由加速度限制，不是 SPEED_SPS：
+//     peak = min(SPEED_SPS, sqrt(2 × ACCEL_SPS2 × 步數))
+//   例：2400 步、ACCEL=120000 → peak≈24000 sps、來回約 0.28 秒。
+//   若要在 2400 步內真的跑到 30000 sps，ACCEL 需 ≥ 187500。
+constexpr float SPEED_SPS = 30000.0f;      // 到位過程最高脈衝速率
+constexpr float ACCEL_SPS2 = 120000.0f;    // 加速度 steps/s²（越大越衝）
+constexpr float MIN_SPS = 330.0f;          // 起步/收尾速率（PIO clkdiv 上限對應 ~327sps）
+constexpr uint32_t DIR_SETTLE_US = 20;     // DIR 建立時間
+constexpr uint32_t RAMP_INTERVAL_US = 100; // 加減速更新週期（100µs）
+
+static int32_t refSteps = 0;        // 目前位置估算（steps，0 = 上電位置）
+static int32_t targetSteps = 0;     // 命令目標（steps）
+static int32_t planTargetSteps = 0; // 本次動作的目標（動作中不變）
+static float planSteps = 0.0f;      // 本次動作總步數（正值）
+static float estSteps = 0.0f;       // 本次動作已發出步數估算
+static float curSps = 0.0f;
+static float peakSps = 0.0f;
+static int8_t curDir = 1;
+static bool moving = false;
+static bool pioReady = false;
+static uint32_t lastRampUs = 0;
+
+static PIO sPio = pio0;
+static uint sSm = 0;
+static uint sOffset = 0;
+constexpr uint kIrqFlag = 0;
+// 每步的 PIO 週期數（set[3] 4 + set[1] 2 + jmp 1）：這是 step_pulse.pio 的程式知識，
+// 留在本檔；速率 → clkdiv 的換算走 PioStepRate::clkdivForSps()。
+constexpr float kCyclesPerStep = 7.0f; // set[3] 4 + set[1] 2 + jmp 1
+static float sClkSysHz = 150000000.0f;
+
+/// 只把本 SM 的 STEP 腳位拉低。
+/// ⚠ 不可用 pio_sm_set_pins()：SDK 會用「victim SM」把整個 PIO 區塊 32 支腳全部寫一次，
+///   會把同一 PIO0 上仰角 UART（SerialPIO）的 TX(GP2) 一起拉低（UART 變 break 準位）。
+static inline void stepPinLow() {
+    if(!pioReady) {
+        return;
+    }
+    pio_sm_exec(sPio, sSm, pio_encode_set(pio_pins, 0));
+}
+
+static int32_t inputToSteps(float input) {
+    if(input > AxisConfig::INPUT_LIMIT) {
+        input = AxisConfig::INPUT_LIMIT;
+    }
+    if(input < -AxisConfig::INPUT_LIMIT) {
+        input = -AxisConfig::INPUT_LIMIT;
+    }
+    // -97~+97 → -2400~+2400 steps
+    return static_cast<int32_t>(roundf(input * STEP_PER_INPUT * INPUT_SIGN));
+}
+
+void init() {
+    sClkSysHz = static_cast<float>(clock_get_hz(clk_sys));
+
+    gpio_init(Pin::ROW_DIR);
+    gpio_set_dir(Pin::ROW_DIR, GPIO_OUT);
+    gpio_put(Pin::ROW_DIR, 0);
+
+    gpio_init(Pin::ROW_EN);
+    gpio_set_dir(Pin::ROW_EN, GPIO_OUT);
+    gpio_put(Pin::ROW_EN, 0); // 致能（低電位）
+
+    int smIdx = pio_claim_unused_sm(sPio, false);
+    if(smIdx < 0) {
+        pioReady = false;
+        return;
+    }
+    sSm = static_cast<uint>(smIdx);
+
+    sOffset = pio_add_program(sPio, &step_pulse_program);
+    pio_sm_config cfg = step_pulse_program_get_default_config(sOffset);
+    sm_config_set_set_pins(&cfg, Pin::ROW_STEP, 1);
+    pio_gpio_init(sPio, Pin::ROW_STEP);
+    pio_sm_set_consecutive_pindirs(sPio, sSm, Pin::ROW_STEP, 1, true);
+
+    pio_sm_init(sPio, sSm, sOffset, &cfg);
+    pio_sm_set_enabled(sPio, sSm, true);
+    pioReady = true;
+    stepPinLow();
+}
+
+static void haltPulses() {
+    if(!pioReady) {
+        return;
+    }
+    pio_sm_set_enabled(sPio, sSm, false);
+    pio_sm_clear_fifos(sPio, sSm);
+    stepPinLow();
+    pio_interrupt_clear(sPio, kIrqFlag);
+}
+
+static void startSegment(int32_t steps) {
+    curDir = (steps > 0) ? 1 : -1;
+    gpio_put(Pin::ROW_DIR, (curDir > 0) ? 1 : 0);
+    delayMicroseconds(DIR_SETTLE_US);
+
+    planTargetSteps = targetSteps;
+    planSteps = static_cast<float>(steps > 0 ? steps : -steps);
+    estSteps = 0.0f;
+
+    peakSps = SPEED_SPS;
+    float triPeak = sqrtf(2.0f * ACCEL_SPS2 * planSteps);
+    if(triPeak < peakSps) {
+        peakSps = (triPeak < MIN_SPS) ? MIN_SPS : triPeak;
+    }
+    curSps = MIN_SPS;
+    lastRampUs = micros();
+    moving = true;
+    storageLog.printf("[STEP] 移動 %ld 步 (pos %ld → %ld) dir=%s",
+                      static_cast<long>(steps > 0 ? steps : -steps),
+                      static_cast<long>(refSteps),
+                      static_cast<long>(planTargetSteps),
+                      curDir > 0 ? "+" : "-");
+
+    if(pioReady) {
+        pio_sm_set_enabled(sPio, sSm, false);
+        pio_sm_clear_fifos(sPio, sSm);
+        pio_sm_restart(sPio, sSm);
+        pio_sm_exec(sPio, sSm, pio_encode_jmp(sOffset));
+        pio_interrupt_clear(sPio, kIrqFlag);
+        pio_sm_set_clkdiv(
+            sPio, sSm,
+            PioStepRate::clkdivForSps(sClkSysHz, kCyclesPerStep, curSps));
+        pio_sm_put(sPio, sSm, static_cast<uint32_t>(steps > 0 ? steps : -steps));
+        pio_sm_set_enabled(sPio, sSm, true);
+    }
+}
+
+/// 設定目標（input -97~97）。Core 1 context。
+void setTarget(float input) {
+    int32_t s = inputToSteps(input);
+    // 行程限制：以中間（0 步）為原點，前 / 後各最多 2400 步
+    if(s > STEP_LIMIT_FRONT)
+        s = STEP_LIMIT_FRONT;
+    if(s < -STEP_LIMIT_BACK)
+        s = -STEP_LIMIT_BACK;
+    targetSteps = s;
+}
+
+/// 目前命令目標 / 位置估算（Core 1 context，供日誌與遙測讀取）
+int32_t targetStepsValue() { return targetSteps; }
+int32_t refStepsValue() { return refSteps; }
+bool isMoving() { return moving; }
+
+/// idleHook：推進水平軸
+void update() {
+    if(!moving) {
+        int32_t diff = targetSteps - refSteps;
+        if(diff == 0) {
+            return; // 已到位，零開銷
+        }
+        startSegment(diff);
+        return;
+    }
+
+    if(pioReady && pio_interrupt_get(sPio, kIrqFlag)) {
+        pio_interrupt_clear(sPio, kIrqFlag);
+        moving = false;
+        refSteps = planTargetSteps;
+        curSps = 0.0f;
+        storageLog.printf("[STEP] 到位 pos=%ld", static_cast<long>(refSteps));
+        return;
+    }
+
+    uint32_t now = micros();
+    uint32_t dtUs = now - lastRampUs;
+    if(dtUs < RAMP_INTERVAL_US) {
+        return;
+    }
+    lastRampUs = now;
+    estSteps += curSps * static_cast<float>(dtUs) * 1e-6f;
+
+    float destSps = peakSps;
+    float left = planSteps - estSteps;
+    float decelDist = (curSps * curSps) / (2.0f * ACCEL_SPS2);
+    if(left <= decelDist + 1.0f) {
+        destSps = MIN_SPS;
+    }
+    float dv = ACCEL_SPS2 * static_cast<float>(dtUs) * 1e-6f;
+    if(curSps < destSps) {
+        curSps += dv;
+        if(curSps > destSps) {
+            curSps = destSps;
+        }
+    } else if(curSps > destSps) {
+        curSps -= dv;
+        if(curSps < destSps) {
+            curSps = destSps;
+        }
+    }
+    if(pioReady) {
+        pio_sm_set_clkdiv(
+            sPio, sSm,
+            PioStepRate::clkdivForSps(sClkSysHz, kCyclesPerStep, curSps));
+    }
+}
+
+/// E-Stop：立即停止脈衝；保留命令目標，E-Stop 解除後自動補回原位
+void estop() {
+    haltPulses();
+    if(moving) {
+        refSteps += (curDir > 0 ? 1 : -1) * static_cast<int32_t>(estSteps + 0.5f);
+        storageLog.printf("[STEP] E-Stop 停止 pos=%ld", static_cast<long>(refSteps));
+    }
+    moving = false;
+    curSps = 0.0f;
+    estSteps = 0.0f;
+}
+
+int32_t positionSteps() { return moving ? refSteps : targetSteps; }
+} // namespace RowStepper
 
 // ============================================================================
 // SlaveApp 回呼
@@ -930,6 +1140,10 @@ static void refreshTelemetry(); // 定義於下方
 
 static void onStorageEstop() {
     MotorControl::estop();
+    // 步進：只由 Core 1 操作 PIO（避免與 idleHook 同時改 PIO 暫存器）
+    if(get_core_num() == 1) {
+        RowStepper::estop();
+    }
     // ⚠️ E-Stop 期間 runCore1() 只會一直呼叫 onEstop，**idleHook 不會被呼叫**，
     //    所以守護刷新與遙測保活要在這裡也跑一次，否則長時間 E-Stop 時：
     //    - 晶片設定若被干擾就沒人修（伺服就把位置結在錯的地方）
@@ -942,6 +1156,13 @@ static void buildTelemetry(); // 定義於下方
 
 static void onStorageCommand(const ChassisSnapshot &cmd) {
     MotorControl::executeMotion(cmd);
+    RowStepper::setTarget(cmd.row); // 水平：STEP/DIR 脈衝
+    // 只在 row 數值變動時記一行（控制幀約 100Hz，不能每幀印）
+    static int16_t sLastRow = 1000;
+    if(cmd.row != sLastRow) {
+        sLastRow = static_cast<int16_t>(cmd.row);
+        storageLog.printf("[ROW] 命令 %d", static_cast<int>(cmd.row));
+    }
     buildTelemetry();
 }
 
@@ -954,6 +1175,10 @@ static void buildTelemetry() {
     pendingTm.currentRps[2] = static_cast<float>(ServoSeq::total());
     pendingTm.currentRps[3] = static_cast<float>(ServoSeq::doneCount());
     pendingTm.targetRps[0] = ServoSeq::isRunning() ? 1.0f : 0.0f;
+    // 水平步進狀態借放 cmdVx/cmdVy/cmdOmega（Storage 不使用車身速度欄位）
+    pendingTm.cmdVx = static_cast<float>(RowStepper::targetStepsValue());
+    pendingTm.cmdVy = static_cast<float>(RowStepper::refStepsValue());
+    pendingTm.cmdOmega = RowStepper::isMoving() ? 1.0f : 0.0f;
     pendingTm.mode = RobotMode::AUTO;
     pendingTm.estopFlag = 0;
     // ⚠ 遙測標頭（sync/msgType/frameSeq/targetID）、timestamp 與 CRC 由
@@ -998,6 +1223,7 @@ static void refreshTelemetry() {
     slave.prepareTelemetry(pendingTm);
 }
 static void storageIdleHook() {
+    RowStepper::update(); // 水平：PIO 脈衝 + 加減速
     ServoSeq::update();
     MotorControl::pollPostChannel();
     MotorControl::holdRefresh();
@@ -1049,182 +1275,53 @@ static void updateStatusLed() {
 // Core 0
 // ============================================================================
 void setup() {
+    EscOutput::init(EscOutput::SPEED_PCT); // ESC GP13 先維持 0%（停轉）
+    RowStepper::init();                    // 水平 STEP/DIR/EN（PIO0 SM）
     statusLed.begin();
     digitalWrite(LED_BUILTIN, HIGH); // 開機先亮（BOOT 狀態）
 
     Serial.begin(115200);
     delay(200);
-    Serial.println("[STORAGE] boot: 只有伺服馬達（PCA9685 I2C0 GP4/GP5）");
+    Serial.println("[STORAGE] boot");
+    Serial.printf("[ESC] GP%u 50Hz 輸出 %u%% (%uus)\n",
+                  static_cast<unsigned>(Pin::ESC_PWM),
+                  static_cast<unsigned>(EscOutput::SPEED_PCT),
+                  static_cast<unsigned>(EscOutput::pulseUsFor(EscOutput::SPEED_PCT)));
 
     slave.begin(); // 硬體 UART0 (GP0/GP1) → Hub
     slave.setIdleHook(storageIdleHook);
-
-    Serial.println("[STORAGE] 等待 Hub 命令（trigger 上緣 → 全部通道跑一次）");
 }
 
 void loop() {
     slave.update();
     updateStatusLed();
-
-    // Core 1 累積的日誌（序列訊息）在這裡印出
     storageLog.drain(Serial);
 
-    // Core 1 初始化完成後，由 Core 0 印一次設定摘要（Serial 只能在 Core 0）
-    static bool initPrinted = false;
-    if(!initPrinted && sPcaInitDone) {
-        initPrinted = true;
-        Serial.printf("[STORAGE] 通道校正%s\n",
-                      sCalLoaded ? "已從 EEPROM 載入" : "使用預設值（16 通道）");
-        // 注意：newlib-nano 沒開浮點 printf，這裡只用整數輸出（度數用 x10 表示）
-        Serial.printf("[STORAGE] PCA9685 0x%02X %s | SLEEP=%s MODE1=0x%02X "
-                      "PRE_SCALE=%u | dwell=%lums settle=%lums\n",
-                      Pca9685Reg::ADDR_DEFAULT, sPcaInitOk ? "OK" : "無回應！",
-                      sPcaAwake ? "已清除(有在送PWM)" : "仍為1(沒脈衝！)",
+    // PCA9685 初始化結果（Core 1 完成後印一次）
+    static bool pcaPrinted = false;
+    if(!pcaPrinted && sPcaInitDone) {
+        pcaPrinted = true;
+        Serial.printf("[PCA] 0x%02X %s | SLEEP=%s MODE1=0x%02X PRE_SCALE=%u\n",
+                      Pca9685Reg::ADDR_DEFAULT, sPcaInitOk ? "OK" : "無回應!",
+                      sPcaAwake ? "否(輸出中)" : "是(無脈衝!)",
                       static_cast<unsigned>(sSnap.mode1),
-                      static_cast<unsigned>(sSnap.prescale),
-                      static_cast<unsigned long>(SeqCfg::DWELL_MS),
-                      static_cast<unsigned long>(SeqCfg::SETTLE_MS));
-
-        // 逐通道 dump：EEPROM 校正期望值 vs PCA9685 晶片內部實際值對照。
-        //   最後兩欄是「晶片真的寫進去的 OFF count / 換算 µs」：
-        //   - 跟前面待機/作動脈寬不同 → I2C 寫入沒落地（接線/上拉/干擾）
-        //   - full-OFF（無脈衝） → 伺服沒訊號（看起來像「沒通電」、不鎖定）
-        //   - full-ON            → 訊號恆高，伺服會往單邊撞
-        Serial.println("[STORAGE] ch en us(min-max) deg(min-max) inv | "
-                       "start→end rev | 待機/作動us | 晶片實際 off(count/µs) / 診斷");
-        for(uint8_t ch = 0; ch < Pca9685Reg::CHANNEL_COUNT; ch++) {
-            const ChannelLimit &l = Limits::channels[ch];
-            const SeqCfg::ServoProfile &pf = SeqCfg::PROFILE[ch];
-            const float restF = SeqCfg::restDeg(ch);
-            const float actF = SeqCfg::activeDeg(ch);
-            const int32_t sT = static_cast<int32_t>(lroundf(pf.startDeg * 10.0f));
-            const int32_t eT = static_cast<int32_t>(lroundf(pf.endDeg * 10.0f));
-            const uint16_t hUs = angleToPulseUs(ch, restF);
-            const uint16_t oUs = angleToPulseUs(ch, actF);
-            const bool hClamp = angleClampedByRange(ch, restF);
-            const bool oClamp = angleClampedByRange(ch, actF);
-            Serial.printf("  %2u  %u  %4u-%4u  %3u-%3u  %u | %4ld.%u→%4ld.%u %s | "
-                          "%4u/%4u",
-                          static_cast<unsigned>(ch),
-                          static_cast<unsigned>(l.enabled),
-                          static_cast<unsigned>(l.minUs),
-                          static_cast<unsigned>(l.maxUs),
-                          static_cast<unsigned>(l.minDeg),
-                          static_cast<unsigned>(l.maxDeg),
-                          static_cast<unsigned>(
-                              Limits::effectiveInvert(ch) ? 1 : 0),
-                          static_cast<long>(sT / 10), static_cast<unsigned>(sT % 10),
-                          static_cast<long>(eT / 10), static_cast<unsigned>(eT % 10),
-                          pf.reverse ? "R" : "F",
-                          static_cast<unsigned>(hUs),
-                          static_cast<unsigned>(oUs));
-            if((sSnap.readOkMask & (1u << ch)) == 0) {
-                Serial.println(" | 讀回失敗（I2C）");
-                continue;
-            }
-            const uint16_t offCount = sSnap.offCount[ch];
-            if((sSnap.fullOffMask & (1u << ch)) != 0)
-                Serial.print(" | full-OFF 無脈衝（伺服不會通電/不鎖定）");
-            else if((sSnap.fullOnMask & (1u << ch)) != 0)
-                Serial.print(" | full-ON 恆高（伺服會往單邊撞死）");
-            else
-                Serial.printf(" | %4u/%4uus", static_cast<unsigned>(offCount),
-                              static_cast<unsigned>(offCount *
-                                                    Pca9685Reg::PERIOD_US /
-                                                    Pca9685Reg::COUNT_SPAN));
-            if(hClamp || oClamp)
-                Serial.printf("  <-- %s%s被 EEPROM 角度範圍夾住（命令到不了，會頂死點）",
-                              hClamp ? "待機 " : "", oClamp ? "作動 " : "");
-            else if(l.enabled && hUs == oUs)
-                Serial.print("  <-- 待機=作動（動作無效，檢查 start/end）");
-            Serial.println();
-        }
-        Serial.println("[STORAGE] ※ 若上表脈寬都正確但伺服不動：檢查 PCA9685 V+ "
-                       "伺服電源、GND 共地、OE 是否拉低");
-
-        // 追加動作（CH6）診斷：EEPROM 沒 enable 也照樣驅動，但脈寬/角度範圍
-        // 若被夾住，伺服就會「不動」或頂在極限「嗡嗡拌」。
-        {
-            const uint8_t ps = SeqCfg::POST_CHANNEL;
-            const ChannelLimit &l = Limits::channels[ps];
-            const float pRest = SeqCfg::restDeg(ps);
-            const float pAct = SeqCfg::activeDeg(ps);
-            Serial.printf("[STORAGE] 追加 CH%u：EEPROM enabled=%u%s | "
-                          "待機 %u°=%uus / 作動 %u°=%uus | dwell %lums\n",
-                          static_cast<unsigned>(ps),
-                          static_cast<unsigned>(l.enabled),
-                          channelEnabledInEeprom(ps) ? "" : "（本版強制驅動）",
-                          static_cast<unsigned>(lroundf(pRest)),
-                          static_cast<unsigned>(angleToPulseUs(ps, pRest)),
-                          static_cast<unsigned>(lroundf(pAct)),
-                          static_cast<unsigned>(angleToPulseUs(ps, pAct)),
-                          static_cast<unsigned long>(SeqCfg::POST_DWELL_MS));
-            if(!channelEnabledInEeprom(ps))
-                Serial.printf("[STORAGE] ※ CH%u 在 EEPROM 是停用（enabled=0）；"
-                              "本版有強制驅動，但校正值（%u-%u° / %u-%uuS）"
-                              "仍是預設/未校正值，請用 pca9685_angle 校正後再寫回\n",
-                              static_cast<unsigned>(ps),
-                              static_cast<unsigned>(l.minDeg),
-                              static_cast<unsigned>(l.maxDeg),
-                              static_cast<unsigned>(l.minUs),
-                              static_cast<unsigned>(l.maxUs));
-            if(angleClampedByRange(ps, pRest) ||
-               angleClampedByRange(ps, pAct))
-                Serial.printf("[STORAGE] ※ CH%u 的 EEPROM 角度範圍 %u-%u° 會把 "
-                              "%u°/%u° 夾住 → 伺服會頂到極限（嗡嗡叫、不鎖定），"
-                              "請用 pca9685_angle 的 'ma 6 <minUs> <maxUs>' 重新校正\n",
-                              static_cast<unsigned>(ps),
-                              static_cast<unsigned>(l.minDeg),
-                              static_cast<unsigned>(l.maxDeg),
-                              static_cast<unsigned>(lroundf(pRest)),
-                              static_cast<unsigned>(lroundf(pAct)));
-        }
-
-        // 已停用通道目前的處理：DRIVE_DISABLED_CHANNELS=true 時仍會停在 HOME，
-        // 只是不參與 trigger 序列；false 時則是 full-OFF（沒有脈衝 → 不鎖定）。
-        {
-            bool anyOff = false;
-            for(uint8_t ch = 0; ch < Pca9685Reg::CHANNEL_COUNT; ch++) {
-                if(channelEnabledInEeprom(ch) || ch == SeqCfg::POST_CHANNEL)
-                    continue;
-                if(!anyOff) {
-                    Serial.print("[STORAGE] ※ EEPROM 未啟用通道：");
-                    anyOff = true;
-                }
-                Serial.printf(" CH%u", static_cast<unsigned>(ch));
-            }
-            if(anyOff)
-                Serial.printf(" → 不參與 trigger 序列，目前%s\n",
-                              SeqCfg::DRIVE_DISABLED_CHANNELS
-                                  ? "仍停在各自待機角度保持鎖定"
-                                  : "輸出 full-OFF（沒有脈衝，會抖、不鎖定）");
-        }
+                      static_cast<unsigned>(sSnap.prescale));
     }
 
-    // 500ms 監控輸出
-    static uint32_t lastPrint = 0;
+    // 每 2 秒一行運作狀態：PCA / 步進 / ESC
+    static uint32_t lastStatusMs = 0;
     const uint32_t nowMs = millis();
-    if(nowMs - lastPrint >= 500) {
-        lastPrint = nowMs;
-        if(slave.isEstopActive()) {
-            Serial.printf("[STORAGE] ** E-STOP ** sinceCmd=%ums 伺服已回 HOME\n",
-                          slave.msSinceLastValidCmd());
-        } else {
-            Serial.printf("[STORAGE] sinceCmd=%ums cnt=%u | seq=%s %u/%u ch=%d "
-                          "cycles=%lu | i2cErr=%lu seqErr=%lu hold=%lu drop=%lu\n",
-                          slave.msSinceLastValidCmd(),
-                          static_cast<unsigned>(slave.validCmdCount()),
-                          ServoSeq::isRunning() ? "RUN" : "IDLE",
-                          static_cast<unsigned>(ServoSeq::progress()),
-                          static_cast<unsigned>(ServoSeq::total()),
-                          static_cast<int>(ServoSeq::currentChannel()),
-                          static_cast<unsigned long>(ServoSeq::doneCount()),
-                          static_cast<unsigned long>(sPca.errorCount()),
-                          static_cast<unsigned long>(
-                              ServoSeq::writeErrorCount()),
-                          static_cast<unsigned long>(MotorControl::repairCount()),
-                          static_cast<unsigned long>(storageLog.dropped()));
-        }
+    if(nowMs - lastStatusMs >= 2000) {
+        lastStatusMs = nowMs;
+        Serial.printf("[STATUS] PCA err=%lu repair=%lu | STEP pos=%ld tgt=%ld %s | "
+                      "ESC %u%% | Hub cmd=%lu\n",
+                      static_cast<unsigned long>(sPca.errorCount()),
+                      static_cast<unsigned long>(MotorControl::repairCount()),
+                      static_cast<long>(RowStepper::refStepsValue()),
+                      static_cast<long>(RowStepper::targetStepsValue()),
+                      RowStepper::isMoving() ? "移動中" : "停止",
+                      static_cast<unsigned>(EscOutput::SPEED_PCT),
+                      static_cast<unsigned long>(slave.validCmdCount()));
     }
 }
 

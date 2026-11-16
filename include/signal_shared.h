@@ -89,11 +89,12 @@ struct ShootPayload {
     int8_t row;       // 旋轉 -100~100
 };
 
-// Storage 控制資料 (3 bytes)
+// Storage 控制資料 (4 bytes)
 struct StoragePayload {
     uint8_t motorChannel; // PCA9685 通道編號 0~15
     uint8_t sw;           // switch 0/1
     uint8_t trigger;      // trigger 0/1
+    int8_t row;           // 水平位置 -97~97 → STEP/DIR 步進
 };
 
 // 完整的 ControlPacket（20 bytes packed）
@@ -107,7 +108,7 @@ struct ControlPacket {
     union {
         MovePayload move;       // targetID == MOVE (3 bytes)
         ShootPayload shoot;     // targetID == SHOOT (4 bytes)
-        StoragePayload storage; // targetID == STORAGE (3 bytes)
+        StoragePayload storage; // targetID == STORAGE (4 bytes)
         uint8_t raw[12];        // 12 bytes payload 空間
     };
 
@@ -117,7 +118,7 @@ struct ControlPacket {
 static_assert(sizeof(ControlPacket) == 20, "ControlPacket 存在填充位元組！");
 static_assert(sizeof(MovePayload) == 3, "MovePayload 不為 3 bytes！");
 static_assert(sizeof(ShootPayload) == 4, "ShootPayload 不為 4 bytes！");
-static_assert(sizeof(StoragePayload) == 3, "StoragePayload 不為 3 bytes！");
+static_assert(sizeof(StoragePayload) == 4, "StoragePayload 不為 4 bytes！");
 
 // ============================================================================
 // MoveTelemetry — Slave → Hub 遙測封包（線路格式）
@@ -154,7 +155,7 @@ static_assert(sizeof(MoveTelemetry) == 72, "MoveTelemetry 大小不正確！");
 // 所有 Slave 共用同一個結構，但依 targetID 使用不同欄位：
 //   MOVE:    vx, vy, omega
 //   SHOOT:   shootUp, shootDown, pitch, row
-//   STORAGE: motorChannel, sw, trigger
+//   STORAGE: motorChannel, sw, trigger, row
 // ============================================================================
 struct ChassisSnapshot {
     // 共用控制值

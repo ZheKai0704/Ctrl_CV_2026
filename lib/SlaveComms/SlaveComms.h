@@ -274,6 +274,7 @@ class SlaveComms {
             snap.motorChannel = pkt.storage.motorChannel;
             snap.sw = pkt.storage.sw;
             snap.trigger = pkt.storage.trigger;
+            snap.row = static_cast<float>(pkt.storage.row);
         }
 
         snap.frameSeq = pkt.frameSeq;

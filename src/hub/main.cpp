@@ -728,6 +728,7 @@ static ControlPacket rcToStoragePacket() {
     pkt.storage.motorChannel = 0; // 本版不使用
     pkt.storage.sw = 0;           // 本版不使用
     pkt.storage.trigger = (rc_channels[RcMap::STORAGE_TRIGGER] < 0) ? 1 : 0;
+    pkt.storage.row = rcToInt8(rc_channels[3]);
 
     pkt.crc16 = 0;
     pkt.crc16 = SignalUtils::calculateCrc(reinterpret_cast<uint8_t *>(&pkt),
@@ -894,10 +895,11 @@ static void tryRcFallback() {
             st.storage.trigger != lastTrigger)) {
             lastStorageDbgUs = nowStorage;
             lastTrigger = st.storage.trigger;
-            Serial.printf("[HUB] → Storage trigger=%u (rc_channels[%u]=%d)\n",
-                          static_cast<unsigned>(st.storage.trigger),
+            Serial.printf("[HUB] → Storage trigger=%u row=%d "
+                          "(rc_channels[%u]=%d rc[3]=%d)\n",
+                          static_cast<unsigned>(st.storage.trigger), st.storage.row,
                           static_cast<unsigned>(RcMap::STORAGE_TRIGGER),
-                          rc_channels[RcMap::STORAGE_TRIGGER]);
+                          rc_channels[RcMap::STORAGE_TRIGGER], rc_channels[3]);
         }
     }
 
@@ -1023,6 +1025,14 @@ void loop() {
                       static_cast<int>(rcShootSpeedPct()),
                       static_cast<unsigned long>(jetsonFrameCount),
                       static_cast<unsigned long>(jetsonDroppedCount));
+        if(lastStorageTmUs != 0) {
+            Serial.printf("[HUB] storage row: cmd=%d target=%ld pos=%ld "
+                          "moving=%d\n",
+                          rcSnapshot[3],
+                          static_cast<long>(latestStorageTm.cmdVx),
+                          static_cast<long>(latestStorageTm.cmdVy),
+                          latestStorageTm.cmdOmega > 0.5f ? 1 : 0);
+        }
     }
 
     delayMicroseconds(20);

@@ -4,8 +4,7 @@
 // 雙軸步進架構（兩種驅動方式並存）：
 //   仰角 (pitch)：UART 閉環步進驅動器（張大頭 X42S / Emm 固件）
 //                 ── PIO 模擬 UART（SerialPIO），TX=GP2, RX=GP3, 115200
-//   水平 (row)  ：傳統 STEP/DIR/EN 驅動器（A4988 / DRV8825 / TB6600）
-//                 ── STEP=GP6 由 PIO 產生脈衝，DIR=GP7，EN=GP8（低電位致能）
+//   水平 (row)  ：已移至 Storage 節點（src/storage/main.cpp），本節點不再處理
 //
 // 使用 SlaveComms 通用框架 + idleHook 機制：
 //   Core 0 (loop)：   SlaveComms::update() — 收 Hub 控制幀（硬體 UART0）
@@ -20,7 +19,7 @@
 //   downSpeed  (int8) — 下輪無刷馬達轉速，永久性速度設定 (0~100)
 //   pitch      (int8) — 仰角位置 (-97~97) → UART 步進馬達
 //                        -97 = 最低角, 0 = 0°, +97 = 最高角
-//   row        (int8) — 水平位置 (-97~97) → STEP/DIR 步進馬達
+//   row        (int8) — 水平位置 (-97~97)；本節點忽略，由 Storage 處理
 //                        -97 = 逆時針 90°, 0 = 0°, +97 = 順時針 90°
 //
 // ⚠ 轉速值由 Hub 決定「絕對值」，本節點只負責套用：
@@ -42,7 +41,6 @@
 // ============================================================================
 #include "SlaveComms.h"
 #include "servo_pulse.pio.h"
-#include "step_pulse.pio.h"
 #include <Arduino.h>
 #include <DebugFmt.h>
 #include <EEPROM.h>
@@ -63,13 +61,9 @@ namespace Pin {
 constexpr uint ELEV_UART_TX = 2; // → 馬達 R/A/H 或 T/B/L
 constexpr uint ELEV_UART_RX = 3; // ← 馬達 T/B/L 或 R/A/H
 
-// ——— 水平 STEP/DIR 步進（STEP 由 PIO 產生） ———
-constexpr uint ROW_STEP = 6; // → 驅動器 PUL
-constexpr uint ROW_DIR = 7;  // → 驅動器 DIR
-constexpr uint ROW_EN = 8;   // → 驅動器 ENA（低電位致能）
 
 // ——— 無刷馬達 (ESC PWM) ———
-// ⚠ GP0/GP1 給 Hub UART、GP2/GP3 給仰角 UART、GP6/7/8 給水平步進，
+// ⚠ GP0/GP1 給 Hub UART、GP2/GP3 給仰角 UART，
 //    無刷馬達使用以下腳位。若新硬體沒有無刷馬達，把 kEnableBldc 設為 false。
 constexpr uint UP_BLDC_PWM = 4;
 constexpr uint DOWN_BLDC_PWM = 5;
@@ -344,211 +338,6 @@ uint8_t deviceAddr() { return Emm::ADDR; }
 } // namespace ElevStepper
 
 // ============================================================================
-// 水平步進：STEP 脈衝由 PIO 產生
-//
-// 架構：
-//   PIO0 一個 SM：step_pulse.pio，固定 7 週期/步
-//     f_step = clk_sys / (7 × clkdiv) → 以 clkdiv 調速與加減速
-//   DIR / EN 由 CPU GPIO 控制（DIR 切換後等 20µs）
-//
-// 流程：
-//   1. onCommand → setTarget()（只寫目標步數，不阻塞）
-//   2. Core 1 idleHook → update()：
-//        未動作且目標 ≠ 位置 → 設 DIR、下令 PIO 發 |diff| 個脈衝
-//        動作中 → 依加速度調整 clkdiv；PIO irq 旗標 → 到位
-//   3. E-Stop → abort()：停 SM、STEP 拉低、以估算步數修正位置
-// ============================================================================
-namespace RowStepper {
-constexpr float STEP_PER_REV = 200.0f;                    // 1.8°/step（全步進）
-constexpr float PULSE_PER_DEGREE = STEP_PER_REV / 360.0f; // ~0.556 step/deg
-constexpr float SPEED_SPS = 600.0f;    // 到位過程最高脈衝速率
-constexpr float ACCEL_SPS2 = 4000.0f;  // 加速度 steps/s²
-constexpr float MIN_SPS = 200.0f;      // 起步/收尾速率
-constexpr uint32_t DIR_SETTLE_US = 20; // DIR 建立時間
-constexpr uint32_t RAMP_INTERVAL_US = 300;
-
-static int32_t refSteps = 0;        // 目前位置估算（steps，0 = 上電位置）
-static int32_t targetSteps = 0;     // 命令目標（steps）
-static int32_t planTargetSteps = 0; // 本次動作的目標（動作中不變）
-static float planSteps = 0.0f;      // 本次動作總步數（正值）
-static float estSteps = 0.0f;       // 本次動作已發出步數估算
-static float curSps = 0.0f;
-static float peakSps = 0.0f;
-static int8_t curDir = 1;
-static bool moving = false;
-static bool pioReady = false;
-static uint32_t lastRampUs = 0;
-
-static PIO sPio = pio0;
-static uint sSm = 0;
-static uint sOffset = 0;
-constexpr uint kIrqFlag = 0;
-// 每步的 PIO 週期數（set[3] 4 + set[1] 2 + jmp 1）：這是 step_pulse.pio 的程式知識，
-// 留在本檔；速率 → clkdiv 的換算走 PioStepRate::clkdivForSps()。
-constexpr float kCyclesPerStep = 7.0f; // set[3] 4 + set[1] 2 + jmp 1
-static float sClkSysHz = 150000000.0f;
-
-/// 只把本 SM 的 STEP 腳位拉低。
-/// ⚠ 不可用 pio_sm_set_pins()：SDK 會用「victim SM」把整個 PIO 區塊 32 支腳全部寫一次，
-///   會把同一 PIO0 上仰角 UART（SerialPIO）的 TX(GP2) 一起拉低（UART 變 break 準位）。
-static inline void stepPinLow() {
-    if(!pioReady) {
-        return;
-    }
-    pio_sm_exec(sPio, sSm, pio_encode_set(pio_pins, 0));
-}
-
-static int32_t inputToSteps(float input) {
-    if(input > AxisConfig::INPUT_LIMIT)
-        input = AxisConfig::INPUT_LIMIT;
-    if(input < -AxisConfig::INPUT_LIMIT)
-        input = -AxisConfig::INPUT_LIMIT;
-    float deg = input * AxisConfig::INPUT_TO_DEG;
-    return static_cast<int32_t>(roundf(deg * PULSE_PER_DEGREE));
-}
-
-void init() {
-    sClkSysHz = static_cast<float>(clock_get_hz(clk_sys));
-
-    gpio_init(Pin::ROW_DIR);
-    gpio_set_dir(Pin::ROW_DIR, GPIO_OUT);
-    gpio_put(Pin::ROW_DIR, 0);
-
-    gpio_init(Pin::ROW_EN);
-    gpio_set_dir(Pin::ROW_EN, GPIO_OUT);
-    gpio_put(Pin::ROW_EN, 0); // 致能（低電位）
-
-    int smIdx = pio_claim_unused_sm(sPio, false);
-    if(smIdx < 0) {
-        pioReady = false;
-        return;
-    }
-    sSm = static_cast<uint>(smIdx);
-
-    sOffset = pio_add_program(sPio, &step_pulse_program);
-    pio_sm_config cfg = step_pulse_program_get_default_config(sOffset);
-    sm_config_set_set_pins(&cfg, Pin::ROW_STEP, 1);
-    pio_gpio_init(sPio, Pin::ROW_STEP);
-    pio_sm_set_consecutive_pindirs(sPio, sSm, Pin::ROW_STEP, 1, true);
-
-    pio_sm_init(sPio, sSm, sOffset, &cfg);
-    pio_sm_set_enabled(sPio, sSm, true);
-    pioReady = true;
-    stepPinLow();
-}
-
-static void haltPulses() {
-    if(!pioReady) {
-        return;
-    }
-    pio_sm_set_enabled(sPio, sSm, false);
-    pio_sm_clear_fifos(sPio, sSm);
-    stepPinLow();
-    pio_interrupt_clear(sPio, kIrqFlag);
-}
-
-static void startSegment(int32_t steps) {
-    curDir = (steps > 0) ? 1 : -1;
-    gpio_put(Pin::ROW_DIR, (curDir > 0) ? 1 : 0);
-    delayMicroseconds(DIR_SETTLE_US);
-
-    planTargetSteps = targetSteps;
-    planSteps = static_cast<float>(steps > 0 ? steps : -steps);
-    estSteps = 0.0f;
-
-    peakSps = SPEED_SPS;
-    float triPeak = sqrtf(2.0f * ACCEL_SPS2 * planSteps);
-    if(triPeak < peakSps) {
-        peakSps = (triPeak < MIN_SPS) ? MIN_SPS : triPeak;
-    }
-    curSps = MIN_SPS;
-    lastRampUs = micros();
-    moving = true;
-
-    if(pioReady) {
-        pio_sm_set_enabled(sPio, sSm, false);
-        pio_sm_clear_fifos(sPio, sSm);
-        pio_sm_restart(sPio, sSm);
-        pio_sm_exec(sPio, sSm, pio_encode_jmp(sOffset));
-        pio_interrupt_clear(sPio, kIrqFlag);
-        pio_sm_set_clkdiv(
-            sPio, sSm,
-            PioStepRate::clkdivForSps(sClkSysHz, kCyclesPerStep, curSps));
-        pio_sm_put(sPio, sSm, static_cast<uint32_t>(steps > 0 ? steps : -steps));
-        pio_sm_set_enabled(sPio, sSm, true);
-    }
-}
-
-/// 設定目標（input -97~97）。Core 1 context。
-void setTarget(float input) { targetSteps = inputToSteps(input); }
-
-/// idleHook：推進水平軸
-void update() {
-    if(!moving) {
-        int32_t diff = targetSteps - refSteps;
-        if(diff == 0) {
-            return; // 已到位，零開銷
-        }
-        startSegment(diff);
-        return;
-    }
-
-    if(pioReady && pio_interrupt_get(sPio, kIrqFlag)) {
-        pio_interrupt_clear(sPio, kIrqFlag);
-        moving = false;
-        refSteps = planTargetSteps;
-        curSps = 0.0f;
-        return;
-    }
-
-    uint32_t now = micros();
-    uint32_t dtUs = now - lastRampUs;
-    if(dtUs < RAMP_INTERVAL_US) {
-        return;
-    }
-    lastRampUs = now;
-    estSteps += curSps * static_cast<float>(dtUs) * 1e-6f;
-
-    float destSps = peakSps;
-    float left = planSteps - estSteps;
-    float decelDist = (curSps * curSps) / (2.0f * ACCEL_SPS2);
-    if(left <= decelDist + 1.0f) {
-        destSps = MIN_SPS;
-    }
-    float dv = ACCEL_SPS2 * static_cast<float>(dtUs) * 1e-6f;
-    if(curSps < destSps) {
-        curSps += dv;
-        if(curSps > destSps) {
-            curSps = destSps;
-        }
-    } else if(curSps > destSps) {
-        curSps -= dv;
-        if(curSps < destSps) {
-            curSps = destSps;
-        }
-    }
-    if(pioReady) {
-        pio_sm_set_clkdiv(
-            sPio, sSm,
-            PioStepRate::clkdivForSps(sClkSysHz, kCyclesPerStep, curSps));
-    }
-}
-
-/// E-Stop：立即停止脈衝；保留命令目標，E-Stop 解除後自動補回原位
-void estop() {
-    haltPulses();
-    if(moving) {
-        refSteps += (curDir > 0 ? 1 : -1) * static_cast<int32_t>(estSteps + 0.5f);
-    }
-    moving = false;
-    curSps = 0.0f;
-    estSteps = 0.0f;
-}
-
-int32_t positionSteps() { return moving ? refSteps : targetSteps; }
-} // namespace RowStepper
-
-// ============================================================================
 // BLDC 速度持久化儲存（EEPROM 模擬）
 // ============================================================================
 namespace SpeedStorage {
@@ -597,7 +386,7 @@ float getDownSpeed() { return persistentDownSpeed; }
 // ============================================================================
 // BLDC 馬達控制 (ESC) — 50Hz servo 脈衝由 PIO 產生
 //
-// 為什麼用 PIO1：PIO0 的 4 個 SM 已被「水平軸脈衝 1 + 仰角 UART 2」佔用。
+// 為什麼用 PIO1：PIO0 的 SM 已被「仰角 UART 2」佔用。
 // RP2350 的 PIO1 預設 GPIO base = 16，要驅動 GP4/5/9 必須先 pio_set_gpio_base(pio1, 0)
 // （只能在該 PIO 尚未載入任何程式時呼叫）。
 //
@@ -739,7 +528,6 @@ static volatile uint32_t dbg_estopCount = 0;
 
 // 最近一次收到的命令（Core 1 寫、Core 0 讀；供序列監控比對解析結果）
 static volatile int8_t dbg_lastPitch = 0;
-static volatile int8_t dbg_lastRow = 0;
 static volatile int8_t dbg_lastUp = 0;
 static volatile int8_t dbg_lastDown = 0;
 
@@ -751,15 +539,15 @@ static void buildTelemetry(uint8_t estopFlag) {
     pendingTm = {};
     // Shoot 遙測：復用 float 陣列
     // currentRps[0] = 上輪速度, [1] = 下輪速度
-    // currentRps[2] = 仰角實測角度(°), [3] = 水平目前步數
+    // currentRps[2] = 仰角實測角度(°), [3] = 保留（水平已移至 Storage）
     pendingTm.currentRps[0] = SpeedStorage::getUpSpeed();
     pendingTm.currentRps[1] = SpeedStorage::getDownSpeed();
     pendingTm.currentRps[2] = ElevStepper::reportedAngleDeg();
-    pendingTm.currentRps[3] = static_cast<float>(RowStepper::positionSteps());
+    pendingTm.currentRps[3] = 0.0f;
     pendingTm.targetRps[0] = SpeedStorage::getUpSpeed();
     pendingTm.targetRps[1] = SpeedStorage::getDownSpeed();
     pendingTm.targetRps[2] = ElevStepper::commandedPulses();
-    pendingTm.targetRps[3] = static_cast<float>(RowStepper::positionSteps());
+    pendingTm.targetRps[3] = 0.0f;
     pendingTm.mode = RobotMode::AUTO;
     pendingTm.estopFlag = estopFlag;
     // ⚠ 遙測標頭（sync/msgType/frameSeq/targetID）、timestamp 與 CRC 由
@@ -774,7 +562,6 @@ static void buildTelemetry(uint8_t estopFlag) {
 static void onShootCommand(const ChassisSnapshot &cmd) {
     dbg_cmdCount++;
     dbg_lastPitch = static_cast<int8_t>(lroundf(cmd.pitch));
-    dbg_lastRow = static_cast<int8_t>(lroundf(cmd.row));
 
     // 轉速：單向電調 → 正規化成 0~100（NaN/負值/超範圍都在這裡收乾）
     const float upSpeed = MathUtils::sanitizePercent(cmd.shootUpSpeed);
@@ -791,7 +578,6 @@ static void onShootCommand(const ChassisSnapshot &cmd) {
 
     // 兩軸步進目標
     ElevStepper::setTarget(cmd.pitch); // 仰角：UART 閉環步進
-    RowStepper::setTarget(cmd.row);    // 水平：STEP/DIR 脈衝
 
     // 遙測（收到有效帧 = E-Stop 已解除）
     buildTelemetry(0);
@@ -813,7 +599,6 @@ static void onShootEstop() {
         return;
     }
     ElevStepper::estop();
-    RowStepper::estop();
 
     // 定期補送 E-Stop 遙測；用 200ms 限制避免 tight loop 灌满 UART
     pushEstopTelemetry();
@@ -852,7 +637,6 @@ static void pushEstopTelemetry() {
 // Core 1 idle hook — 每 spinloop 迭代空閒時推進兩軸
 // ============================================================================
 static void shootIdleHook() {
-    RowStepper::update();  // 水平：PIO 脈衝 + 加減速
     ElevStepper::poll();   // 仰角：非阻塞收位置回覆 + 定時讀取
 }
 
@@ -946,8 +730,6 @@ void setup() {
     //   slave.runCore1() spinloop 裡；Serial.begin()/delay() 會拖上百 ms。
     //   先鎖定硬體再把腳位交給 PIO，避免開機期間馬達亂動。
     BldcControl::init();
-    // 再取用水平軸的 PIO SM，最後啟動仰角 UART（同為 PIO0，先取先贏）
-    RowStepper::init();
     elevSerial.begin(115200); // PIO 模擬 UART → 仰角步進驅動器
 
     statusLed.begin();
@@ -955,7 +737,7 @@ void setup() {
 
     Serial.begin(115200);
     delay(200);
-    Serial.println("[SHOOT] boot: 仰角=UART步進(GP2/3) 水平=STEP/DIR/EN(GP6/7/8)");
+    Serial.println("[SHOOT] boot: 仰角=UART步進(GP2/3)");
 
     slave.begin(); // 硬體 UART0 (GP0/GP1) → Hub
     slave.setIdleHook(shootIdleHook);
@@ -988,15 +770,13 @@ void loop() {
             Serial.printf("[SHOOT] sinceCmd=%ums cnt=%u led=%s | cmd pitch=%d row=%d | ",
                           since, static_cast<unsigned>(dbg_cmdCount),
                           ledStateName(static_cast<LedState>(dbg_ledState)),
-                          static_cast<int>(dbg_lastPitch),
-                          static_cast<int>(dbg_lastRow));
+                          static_cast<int>(dbg_lastPitch));
             // 不用 %f：newlib-nano 沒開 _printf_float，改用 DebugFmt 的整數手法
             Serial.print("仰角 ");
             DebugFmt::printFixed1(Serial, ElevStepper::reportedAngleDeg());
             Serial.print("° (cmd ");
             DebugFmt::printFixed1(Serial, ElevStepper::commandedAngleDeg());
-            Serial.printf("°) 水平 %ld 步 | up=%d down=%d | rx=%u crc=%u | elev rep=%u frx=%u\n",
-                          static_cast<long>(RowStepper::positionSteps()),
+            Serial.printf("°) | up=%d down=%d | rx=%u crc=%u | elev rep=%u frx=%u\n",
                           static_cast<int>(upSpeed), static_cast<int>(downSpeed),
                           static_cast<unsigned>(slave.rxFrameCount()),
                           static_cast<unsigned>(slave.rxCrcErrorCount()),

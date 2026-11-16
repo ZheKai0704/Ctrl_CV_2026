@@ -44,8 +44,8 @@
 // 腳位
 // ============================================================================
 namespace Pin {
-constexpr uint MOTOR_A_PWM = 18; // GP18 → ESC1 信號 (馬達 A)
-constexpr uint MOTOR_B_PWM = 19; // GP19 → ESC2 信號 (馬達 B)
+constexpr uint MOTOR_A_PWM = 16; // GP18 → ESC1 信號 (馬達 A)
+constexpr uint MOTOR_B_PWM = 17; // GP19 → ESC2 信號 (馬達 B)
 constexpr uint MOTOR_C_PWM = 20; // GP20 → ESC3 信號 (馬達 C)
 } // namespace Pin
 
@@ -62,17 +62,17 @@ constexpr uint32_t PWM_CLKDIV = 150; // 150MHz/150 = 1MHz → 每 tick = 1µs
 constexpr uint16_t PWM_WRAP = 19999; // 20ms → 50Hz
 constexpr uint16_t PULSE_MIN = 1000; // 0%（出力的最低/熄火點 → 校準低端點）
 constexpr uint16_t PULSE_MAX = 2000; // 100%（全速油門 → 校準高端點）
-constexpr int16_t  MAX_PCT  = 100;   // 出力上限 %
+constexpr int16_t MAX_PCT = 100;     // 出力上限 %
 
 // --- 緩加速 / 緩減速 (slew rate) ---
 // 內部出力以 0.001% 為單位（OUT_SCALE），避免低速率時被整數截斷而永遠不動。
-constexpr int32_t OUT_SCALE = 1000;             // 1% = 1000 單位
-constexpr int32_t OUT_MAX   = MAX_PCT * OUT_SCALE;
-constexpr int32_t RAMP_UP_PCT_S_DEF   = 40;     // 預設加速率 %/s
-constexpr int32_t RAMP_DOWN_PCT_S_DEF = 60;     // 預設減速率 %/s
-constexpr int32_t RAMP_MIN_PCT_S      = 1;      // 速率下限 %/s
-constexpr int32_t RAMP_MAX_PCT_S      = 400;    // 速率上限 %/s
-constexpr uint32_t RAMP_TICK_US       = 2000;   // slew 更新週期 2ms
+constexpr int32_t OUT_SCALE = 1000; // 1% = 1000 單位
+constexpr int32_t OUT_MAX = MAX_PCT * OUT_SCALE;
+constexpr int32_t RAMP_UP_PCT_S_DEF = 40;   // 預設加速率 %/s
+constexpr int32_t RAMP_DOWN_PCT_S_DEF = 60; // 預設減速率 %/s
+constexpr int32_t RAMP_MIN_PCT_S = 1;       // 速率下限 %/s
+constexpr int32_t RAMP_MAX_PCT_S = 400;     // 速率上限 %/s
+constexpr uint32_t RAMP_TICK_US = 2000;     // slew 更新週期 2ms
 } // namespace Esc
 
 // 目前目標（未 slew 完成的即時值）+ 實際輸出
@@ -81,20 +81,24 @@ static int32_t s_out[MOTOR_COUNT] = {0, 0, 0};
 static int16_t s_cmd[MOTOR_COUNT] = {0, 0, 0}; // 目標 %
 
 // 加減速率（單位 0.001%/s）
-static int32_t s_rampUp   = Esc::RAMP_UP_PCT_S_DEF * Esc::OUT_SCALE;
+static int32_t s_rampUp = Esc::RAMP_UP_PCT_S_DEF * Esc::OUT_SCALE;
 static int32_t s_rampDown = Esc::RAMP_DOWN_PCT_S_DEF * Esc::OUT_SCALE;
 
 static uint16_t outToPulse(int32_t out) {
-    if(out < 0) out = 0;
-    if(out > Esc::OUT_MAX) out = Esc::OUT_MAX;
+    if(out < 0)
+        out = 0;
+    if(out > Esc::OUT_MAX)
+        out = Esc::OUT_MAX;
     int32_t pulse = Esc::PULSE_MIN +
                     out * (int32_t)(Esc::PULSE_MAX - Esc::PULSE_MIN) / Esc::OUT_MAX;
     return (uint16_t)pulse;
 }
 
 static int16_t outToPct(int32_t out) {
-    if(out < 0) out = 0;
-    if(out > Esc::OUT_MAX) out = Esc::OUT_MAX;
+    if(out < 0)
+        out = 0;
+    if(out > Esc::OUT_MAX)
+        out = Esc::OUT_MAX;
     return static_cast<int16_t>((out + Esc::OUT_SCALE / 2) / Esc::OUT_SCALE);
 }
 
@@ -110,8 +114,10 @@ static void setupPwm(uint gpio) {
 
 // 直接寫入某個出力（跳過 slew）——僅急停 X / 校準 CAL 使用
 static void hardSet(uint8_t idx, int16_t pct) {
-    if(pct < 0) pct = 0;
-    if(pct > Esc::MAX_PCT) pct = Esc::MAX_PCT;
+    if(pct < 0)
+        pct = 0;
+    if(pct > Esc::MAX_PCT)
+        pct = Esc::MAX_PCT;
     s_out[idx] = static_cast<int32_t>(pct) * Esc::OUT_SCALE;
     setPulse(MOTOR_PWM[idx], outToPulse(s_out[idx]));
 }
@@ -121,8 +127,10 @@ static void hardIdle(uint8_t idx) { hardSet(idx, 0); }
 // 緩加速/緩減速：朝 target 以 dtUs 內允許的量逐步靠近（0.001% 單位）
 static void slewToward(uint8_t idx, int16_t targetPct, uint32_t dtUs) {
     int32_t target = static_cast<int32_t>(targetPct) * Esc::OUT_SCALE;
-    if(target < 0) target = 0;
-    if(target > Esc::OUT_MAX) target = Esc::OUT_MAX;
+    if(target < 0)
+        target = 0;
+    if(target > Esc::OUT_MAX)
+        target = Esc::OUT_MAX;
 
     int32_t &out = s_out[idx];
     int32_t diff = target - out;
@@ -134,22 +142,27 @@ static void slewToward(uint8_t idx, int16_t targetPct, uint32_t dtUs) {
     // 依方向選加速率 / 減速率，算出這一 tick 允許的變化量
     int32_t rate = (diff > 0) ? s_rampUp : s_rampDown; // 0.001%/s
     int64_t step = static_cast<int64_t>(rate) * static_cast<int64_t>(dtUs) / 1000000;
-    if(step < 1) step = 1; // 速率再低也要有進展（否則永遠動不了）
+    if(step < 1)
+        step = 1; // 速率再低也要有進展（否則永遠動不了）
 
     if(diff > 0) {
         out += (diff > step) ? static_cast<int32_t>(step) : diff;
     } else {
         out -= (-diff > step) ? static_cast<int32_t>(step) : -diff;
     }
-    if(out < 0) out = 0;
-    if(out > Esc::OUT_MAX) out = Esc::OUT_MAX;
+    if(out < 0)
+        out = 0;
+    if(out > Esc::OUT_MAX)
+        out = Esc::OUT_MAX;
     setPulse(MOTOR_PWM[idx], outToPulse(out));
 }
 
 // 速率設定（%/s → 0.001%/s）
 static void setRampRate(int32_t &rate, int16_t pctPerSec) {
-    if(pctPerSec < Esc::RAMP_MIN_PCT_S) pctPerSec = Esc::RAMP_MIN_PCT_S;
-    if(pctPerSec > Esc::RAMP_MAX_PCT_S) pctPerSec = Esc::RAMP_MAX_PCT_S;
+    if(pctPerSec < Esc::RAMP_MIN_PCT_S)
+        pctPerSec = Esc::RAMP_MIN_PCT_S;
+    if(pctPerSec > Esc::RAMP_MAX_PCT_S)
+        pctPerSec = Esc::RAMP_MAX_PCT_S;
     rate = static_cast<int32_t>(pctPerSec) * Esc::OUT_SCALE;
 }
 
@@ -157,7 +170,8 @@ static void setRampRate(int32_t &rate, int16_t pctPerSec) {
 static int32_t maxOut() {
     int32_t m = 0;
     for(uint8_t i = 0; i < MOTOR_COUNT; i++)
-        if(s_out[i] > m) m = s_out[i];
+        if(s_out[i] > m)
+            m = s_out[i];
     return m;
 }
 
@@ -177,7 +191,8 @@ static bool pollLine() {
                                     s_line[s_lineLen - 1] == ' ' ||
                                     s_line[s_lineLen - 1] == '\t'))
                 s_lineLen--;
-            if(s_lineLen == 0) continue; // 空行忽略，不自動印幫助
+            if(s_lineLen == 0)
+                continue; // 空行忽略，不自動印幫助
             s_line[s_lineLen] = '\0';
             return true;
         }
@@ -199,13 +214,21 @@ static bool pollLine() {
 }
 
 static bool parseNum(const char *str, int16_t &val) {
-    if(*str == '-') return false; // 單向油門不接受負值
-    if(*str == '+') str++;
-    if(*str == '\0') return false;
+    if(*str == '-')
+        return false; // 單向油門不接受負值
+    if(*str == '+')
+        str++;
+    if(*str == '\0')
+        return false;
     long v = 0;
-    while(*str >= '0' && *str <= '9') { v = v * 10 + (*str - '0'); str++; }
-    if(*str != '\0') return false;
-    if(v > 32767) v = 32767;
+    while(*str >= '0' && *str <= '9') {
+        v = v * 10 + (*str - '0');
+        str++;
+    }
+    if(*str != '\0')
+        return false;
+    if(v > 32767)
+        v = 32767;
     val = static_cast<int16_t>(v);
     return true;
 }
@@ -255,7 +278,8 @@ static bool runThrottleCal() {
     }
 
     // flush 殘留
-    while(Serial.available()) Serial.read();
+    while(Serial.available())
+        Serial.read();
 
     Serial.println();
     Serial.println("== 油門端點校準 (CAL) — 務必先拆槳 ==");
@@ -265,8 +289,10 @@ static bool runThrottleCal() {
     Serial.println();
     Serial.println("  現把三顆出力拉到 100% (2000µs)…");
     // 1) 先送全油門 —— 讓電調『以此開機』進入校準
-    for(uint8_t i = 0; i < MOTOR_COUNT; i++) setPulse(MOTOR_PWM[i], Esc::PULSE_MAX);
-    for(uint8_t i = 0; i < MOTOR_COUNT; i++) s_out[i] = Esc::OUT_MAX;
+    for(uint8_t i = 0; i < MOTOR_COUNT; i++)
+        setPulse(MOTOR_PWM[i], Esc::PULSE_MAX);
+    for(uint8_t i = 0; i < MOTOR_COUNT; i++)
+        s_out[i] = Esc::OUT_MAX;
     Serial.println("  請在接下來 6 秒內『關電調電源 → 再上電』");
     Serial.println("  (上電後若聽到『嗶嗶嗶』即進入校準;馬達不該轉)");
     for(int i = 6; i > 0; i--) {
@@ -277,8 +303,10 @@ static bool runThrottleCal() {
     Serial.println("  繼續高油門 2s 記高端點 …(期待『嗶』)");
     delay(2000);
     // 3) 回 0% 收低端點(當下電調原在高端,回低 = 設定 0% 邊界)
-    for(uint8_t i = 0; i < MOTOR_COUNT; i++) setPulse(MOTOR_PWM[i], Esc::PULSE_MIN);
-    for(uint8_t i = 0; i < MOTOR_COUNT; i++) s_out[i] = 0;
+    for(uint8_t i = 0; i < MOTOR_COUNT; i++)
+        setPulse(MOTOR_PWM[i], Esc::PULSE_MIN);
+    for(uint8_t i = 0; i < MOTOR_COUNT; i++)
+        s_out[i] = 0;
     Serial.println("  回 0% (1000µs) 記低端點 …(期待『嗶嗶』)");
     delay(1500);
     Serial.println("  校準完成(設定即存於電調 EEPROM)。");
@@ -299,20 +327,27 @@ static void parseOp() {
     // 取連續字母(不分大小寫→存大寫)
     while(i < 4 && *p != '\0') {
         char c = *p;
-        if(!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z'))) break;
+        if(!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')))
+            break;
         s_op[i] = (c >= 'a' && c <= 'z') ? (char)(c - ('a' - 'A')) : c;
         i++;
         p++;
     }
     s_op[i] = '\0';
     // 跳過 op 後空白
-    while(*p == ' ' || *p == '\t') p++;
+    while(*p == ' ' || *p == '\t')
+        p++;
     s_num = p; // 數字起點(或沒數字時指向 op 後位置/空)
 }
 
 // 字串比較(剛好長度)
 static bool opEq(const char *op, const char *w) {
-    while(*op != '\0' && *w != '\0') { if(*op != *w) return false; op++; w++; }
+    while(*op != '\0' && *w != '\0') {
+        if(*op != *w)
+            return false;
+        op++;
+        w++;
+    }
     return *op == '\0' && *w == '\0';
 }
 
@@ -337,7 +372,8 @@ static void handleCommand() {
     if(first == '+' || first == '-' || first == '0') {
         if(first == '0') { // 整列以 0 開頭 → 緩降停(三顆回0)
             int32_t mOut = maxOut();
-            for(uint8_t i = 0; i < MOTOR_COUNT; i++) s_cmd[i] = 0;
+            for(uint8_t i = 0; i < MOTOR_COUNT; i++)
+                s_cmd[i] = 0;
             // s_rampDown 單位 0.001%/s、mOut 單位 0.001% → 比值即秒數(×10 取一位)
             int32_t etaTenths = (s_rampDown > 0) ? (mOut * 10) / s_rampDown : 0;
             Serial.printf("三顆緩降至 0%%（DEC %d %%/s → 約 %d.%ds）\r\n",
@@ -348,12 +384,15 @@ static void handleCommand() {
         // +/- 微調(帶量為正數,如 +5 加 / -10 減…);此直接當增量
         int16_t delta = 5, tmp;
         const char *np = &s_line[1];
-        while(*np == ' ' || *np == '\t') np++;
-        if(parseNum(np, tmp) && tmp >= 0 && tmp <= 100) delta = tmp;
+        while(*np == ' ' || *np == '\t')
+            np++;
+        if(parseNum(np, tmp) && tmp >= 0 && tmp <= 100)
+            delta = tmp;
         int16_t d = (first == '+') ? delta : -delta;
         for(uint8_t i = 0; i < MOTOR_COUNT; i++) {
             s_cmd[i] = static_cast<int16_t>(outToPct(s_out[i]) + d);
-            if(s_cmd[i] < 0) s_cmd[i] = 0;
+            if(s_cmd[i] < 0)
+                s_cmd[i] = 0;
         }
         Serial.printf("微調 → A %d%%  B %d%%  C %d%%（斜坡中）\r\n", (int)s_cmd[0],
                       (int)s_cmd[1], (int)s_cmd[2]);
@@ -362,13 +401,19 @@ static void handleCommand() {
 
     parseOp();
     if(s_op[0] == '\0') {
-        if(s_lineLen == 0) { printHelp(); return; }
+        if(s_lineLen == 0) {
+            printHelp();
+            return;
+        }
         Serial.println("?? 未知命令，鍵入 'h' 看用法");
         return;
     }
 
     // 純字面(無需數字)命令
-    if(opEq(s_op, "H") || opEq(s_op, "?")) { printHelp(); return; }
+    if(opEq(s_op, "H") || opEq(s_op, "?")) {
+        printHelp();
+        return;
+    }
     if(opEq(s_op, "R")) {
         printStatus();
         return;
@@ -394,8 +439,10 @@ static void handleCommand() {
                           (int)Esc::RAMP_MAX_PCT_S);
             return;
         }
-        if(opEq(s_op, "ACC")) setRampRate(s_rampUp, rate);
-        else setRampRate(s_rampDown, rate);
+        if(opEq(s_op, "ACC"))
+            setRampRate(s_rampUp, rate);
+        else
+            setRampRate(s_rampDown, rate);
         Serial.printf("加速率 ACC %d %%/s   減速率 DEC %d %%/s\r\n",
                       (int)(s_rampUp / Esc::OUT_SCALE),
                       (int)(s_rampDown / Esc::OUT_SCALE));
@@ -408,7 +455,8 @@ static void handleCommand() {
         Serial.println("?? 數字無效／負值(單向)或指令不符，鍵入 'h'");
         return;
     }
-    if(pct > Esc::MAX_PCT) pct = Esc::MAX_PCT;
+    if(pct > Esc::MAX_PCT)
+        pct = Esc::MAX_PCT;
 
     if(opEq(s_op, "A") || opEq(s_op, "1")) {
         s_cmd[0] = pct;
@@ -420,13 +468,13 @@ static void handleCommand() {
         s_cmd[2] = pct;
         Serial.printf("馬達C → %d%%（緩慢趨近中）\r\n", (int)s_cmd[2]);
     } else if(opEq(s_op, "ALL") || opEq(s_op, "L")) {
-        for(uint8_t i = 0; i < MOTOR_COUNT; i++) s_cmd[i] = pct;
+        for(uint8_t i = 0; i < MOTOR_COUNT; i++)
+            s_cmd[i] = pct;
         Serial.printf("三顆同→ %d%%（緩慢趨近中）\r\n", (int)pct);
     } else {
         Serial.println("?? 未知命令，鍵入 'h' 看用法");
     }
 }
-
 
 // ============================================================================
 // setup / loop
@@ -437,7 +485,8 @@ void setup() {
     Serial.println();
     Serial.println("[esc_test] 單向無刷馬達 (Skywalker 油門) 測試 — 三顆");
 
-    for(uint8_t i = 0; i < MOTOR_COUNT; i++) setupPwm(MOTOR_PWM[i]);
+    for(uint8_t i = 0; i < MOTOR_COUNT; i++)
+        setupPwm(MOTOR_PWM[i]);
 
     // 上電即 0% → 1000µs→熄火;等待電調辨識解鎖
     for(uint8_t i = 0; i < MOTOR_COUNT; i++) {
@@ -461,14 +510,17 @@ void loop() {
         yield();
         return;
     }
-    if(dtUs > 100000) dtUs = 100000; // 過長（如 CAL 後）夾住，避免跳級
+    if(dtUs > 100000)
+        dtUs = 100000; // 過長（如 CAL 後）夾住，避免跳級
     lastTickUs = nowUs;
 
-    for(uint8_t i = 0; i < MOTOR_COUNT; i++) slewToward(i, s_cmd[i], dtUs);
+    for(uint8_t i = 0; i < MOTOR_COUNT; i++)
+        slewToward(i, s_cmd[i], dtUs);
 
     if(pollLine()) {
         handleCommand();
         s_lineLen = 0;
-        for(uint8_t i = 0; i < sizeof(s_line); i++) s_line[i] = '\0';
+        for(uint8_t i = 0; i < sizeof(s_line); i++)
+            s_line[i] = '\0';
     }
 }

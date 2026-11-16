@@ -40,9 +40,9 @@
 // 腳位
 // ============================================================================
 namespace Pin {
-constexpr uint STEP = 2; // → 驅動器 PUL（PIO0 SM0 產生，固定 7 週期/步）
-constexpr uint DIR = 3;  // → 驅動器 DIR
-constexpr uint EN = 4;   // → 驅動器 ENA
+constexpr uint STEP = 17; // → 驅動器 PUL（PIO0 SM0 產生，固定 7 週期/步）
+constexpr uint DIR = 16;  // → 驅動器 DIR
+constexpr uint EN = 18;   // → 驅動器 ENA
 } // namespace Pin
 
 // ============================================================================
