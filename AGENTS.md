@@ -377,24 +377,23 @@ UART0 @ 420000 baud
 | `rc[1]` | vy（前後移動） | Move |
 | `rc[2]` | pitch（上下仰角 -97~97） | Shoot |
 | `rc[3]` | row（左右水平 -97~97） | Shoot |
-| `rc[4]` | 投射輪啟停：< 0 → 開（轉速固定 50%），≥ 0 → 0（停轉） | Shoot |
+| `rc[4]` | 馬達總開關：≥ 0 → 開（投射輪轉速固定 50% + Storage ESC），< 0 → 停<br>（2026 反相：原為 < 0 開 / ≥ 0 停；不管 Move 四輪） | Shoot / Storage |
 | `rc[5]` | 控制來源切換：< -10 → 遙控接管全部 Slave；其餘 → Jetson 持有全部控制權（遙控器只讀本開關） | Hub |
-| `rc[6]` | 上下射轉速微調：< -10 → +5%、> +10 → -5%（上下同時）<br>⚠ 同時也是 Move 的 omega | Shoot / Move |
-| `rc[7]` | —（保留） | — |
+| `rc[6]` | 已停用（上下射轉速固定 50%，不再微調） | — |
+| `rc[7]` | omega（底盤 cw/ccw 旋轉） | Move |
 | `rc[8]` | trigger：< 0 → 全部伺服跑一次循環 | Storage |
 | `rc[9]` | 保留（Storage 本版未使用） | Storage |
 
-> Move 的 omega 與 Storage 的 trigger 已分開：omega 與上下射轉速微調共用 **`rc[6]`**、storage trigger = **`rc[8]`**。
+> Move 的 omega（`rc[7]`）與 Storage 的 trigger（`rc[8]`）已分開；`rc[6]` 已停用。
 
 > Hub 端 `src/hub/main.cpp` 的 `RcMap` 集中管理通道與方向：
-> `RcMap::VX=0`、`RcMap::VY=1`、`RcMap::OMEGA=6`、`RcMap::SHOOT_ENABLE=4`、
-> `RcMap::SOURCE_SELECT=5`、`RcMap::SHOOT_SPEED=6`、`RcMap::STORAGE_TRIGGER=8`
+> `RcMap::VX=0`、`RcMap::VY=1`、`RcMap::OMEGA=7`、`RcMap::SHOOT_ENABLE=4`、
+> `RcMap::SOURCE_SELECT=5`、`RcMap::STORAGE_TRIGGER=8`（`rc[6]` 的 SHOOT_SPEED 已移除）
 > （數值就是 `rc[N]` 的 N）；
 > **方向（實機實測）：`VX_SIGN=-1`、`VY_SIGN=+1`、`OMEGA_SIGN=-1`。**
 >
-> 上下射轉速（`RcShootCfg`）：基準固定 `BASE_PCT=50`%，`rc[6]` 每觸發一次
-> 微調 `STEP_PCT=5`%（微調量 ±50，等效 0~100%）——方向邊緣觸發；
-> 若要「按住連續微調」把 `HOLD_REPEAT_MS` 設成 > 0（例如 250）。上下兩顆永遠同值。
+> 上下射轉速（`RcShootCfg`）：固定 `BASE_PCT=50`%（rc[6] 微調功能已移除，
+> 開關只由 `rc[4]` 控制）。上下兩顆永遠同值。
 >
 > Move 速度刻度（`RcMoveCfg`）：`FULL_TRANSLATE_RPS=1.20`、`FULL_OMEGA=7.00`；
 > 死區 ±10 後重新映射 0~100，避免過死區時跳動。
@@ -415,7 +414,7 @@ UART0 @ 420000 baud
    只看同一個值，不會出現兩邊同時送命令。
 6. `RC_FORWARD_SHOOT=true`：RC 備援時同時轉發 Shoot（`rc[2]`→仰角、
    `rc[3]`→水平、`rc[4]` 開關→投射輪開/關）。
-   投射輪開啟時轉速固定 50%，再用 `rc[6]` 每次 ±5% 微調；
+   投射輪開啟時轉速固定 50%（rc[6] 微調已移除）；
    不隨油門全速，避免瞬間大電流造成電壓下陷、四輪出力不一致（直走會偏）
 
 ---

@@ -55,6 +55,19 @@
 #include <SerialPIO.h>
 #include <StatusLed.h>
 #include <cmath>         // lroundf / fabsf
+
+// ============================================================================
+// 控制來源切換按鈕（GP14）
+//
+// 按鈕一端接 GP14、另一端接 GND（內部上拉，按下 = LOW）。
+// 用途：遙控器「真的斷線」時（非短暫斷線），按下按鈕 → 改為 Jetson 控制。
+//       遙控器恢復連線後自動解除，回到 rc[5] 判斷。
+// ============================================================================
+namespace BtnCfg {
+constexpr uint8_t PIN = 14;               // 按鈕腳位（接 GND）
+constexpr uint32_t DEBOUNCE_MS = 20;      // 防彈跳時間
+constexpr uint32_t RC_LINK_LOST_MS = 300; // failsafe 持續超過此時間才算「真的斷線」
+} // namespace BtnCfg
 #include <cstring>       // memcpy
 #include <pico/stdlib.h> // time_us_64()
 
@@ -346,23 +359,41 @@ static uint32_t jetsonDroppedCount = 0; // 因「遙控接管」而被丟棄的 
 static uint8_t rcFallbackSeq = 0;       // RC 備援轉發用的 frameSeq
 static uint64_t lastRcForwardUs = 0;    // RC 備援最後轉發時間
 
+// ----------------------------------------------------------------------------
+// GP14 按鈕 + RC 連線穩態過濾狀態
+// ----------------------------------------------------------------------------
+static bool btnStableLevel = HIGH;   // 防彈跳後的電位（HIGH = 沒按）
+static uint32_t btnLastChangeMs = 0; // 上次電位變動時間（millis）
+
+// RC 連線「穩態」：crsf failsafe 需連續超過 BtnCfg::RC_LINK_LOST_MS
+// 才視為真的斷線（false）。短暫斷線期間維持 true，模式不切換、不送 E-Stop。
+static bool rcLinkUp = false;
+static bool rcEverSeen = false;      // 是否曾經收過任何 RC 幀
+static uint64_t rcLostSinceUs = 0;   // failsafe 開始時間（0 = 目前在線）
+
 // ============================================================================
 // 控制來源（本版規則）
 //
 //   JETSON      — Jetson 持有「全部」控制權：
 //                 Move / Shoot / Storage 的所有命令、所有通道值都只來自 Jetson。
-//                 遙控器只准讀 rc[4]（切換開關），其他 rc[0..3]、rc[5..9]
+//                 遙控器只准讀 rc[5]（切換開關），其他 rc[0..4]、rc[6..9]
 //                 一律不參與，連 RC Failsafe 也不會送 E-Stop。
-//   RC_SWITCH   — rc[4] 切到遙控邊（< -10）：遙控器接管全部 Slave，
+//   RC_SWITCH   — rc[5] 切到遙控邊（< -10）：遙控器接管全部 Slave，
 //                 Jetson 命令全部丟棄（仍保留心跳/時間戳）。
 //   RC_FALLBACK — Jetson 逾時 >500ms：自動備援，遙控器接管。
+//   JETSON_BTN  — 遙控器「真的斷線」時按下 GP14 按鈕：鎖存改由 Jetson 控制，
+//                 Jetson 恢復送幀即接管；遙控器回線後自動解除鎖存。
 //
 // 判斷結果每圈 loop() 只算一次，onJetsonFrame() 與 RC 轉發都只看這個值，
 // 避免「同一個 loop 內兩邊各判一次」造成兩邊同時送命令。
 enum class ControlSource : uint8_t { JETSON = 0,
                                      RC_SWITCH,
-                                     RC_FALLBACK };
+                                     RC_FALLBACK,
+                                     JETSON_BTN };
 static ControlSource gSource = ControlSource::JETSON;
+
+// 遙控斷線時按 GP14 按鈕 → 鎖存 Jetson 控制；遙控回線後清除
+static bool gBtnJetsonLatched = false;
 
 // ============================================================================
 // 狀態 LED（板載 LED_BUILTIN）— 與 Move Slave 相同的顯示邏輯
@@ -402,9 +433,9 @@ static constexpr uint8_t LED_PATTERN_COUNT =
     static_cast<uint8_t>(sizeof(kLedPatterns) / sizeof(kLedPatterns[0]));
 static StatusLed statusLed(LED_BUILTIN, kLedPatterns, LED_PATTERN_COUNT);
 
-// 遙控是否真的在送資料（Core 1 寫的計數 + Failsafe 旗標）
+// 遙控是否真的在送資料（穩態：短暫 failsafe 仍視為在線）
 static bool rcLinkAlive() {
-    return !rc_failsafe && crsf.getFrameCount() > 0;
+    return rcEverSeen && rcLinkUp;
 }
 
 static LedState currentLedState() {
@@ -417,8 +448,8 @@ static LedState currentLedState() {
     // 兩種來源都沒資料 → 長亮（剛開機或完全沒受控）
     if(jetsonFrameCount == 0 && !rcLinkAlive())
         return LedState::BOOT;
-    // Jetson 沒資料、遥控也斷線 → E-Stop，長亮
-    if(!jetsonActive && rc_failsafe)
+    // Jetson 沒資料、遙控也真的斷線（非短暫斷線）→ E-Stop，長亮
+    if(!jetsonActive && !rcLinkUp)
         return LedState::ESTOP;
     // 有控制流：Jetson 在送幀，或遙控正接管（rc[4] 切換 / Jetson 逾時備援）
     if(jetsonActive || gSource != ControlSource::JETSON)
@@ -452,20 +483,17 @@ static void forwardAllSlaves(const ControlPacket &pkt) {
 //   Move:
 //     rc[0] → vx       左右平移
 //     rc[1] → vy       前後移動
-//     rc[6] → omega    cw/ccw 旋轉
+//     rc[7] → omega    cw/ccw 旋轉
 //     （方向實測：前後正常；左右與 cw/ccw 需反相 VX_SIGN/OMEGA_SIGN = -1）
 //
-//   控制來源：
-//     rc[7] → 底盤旋轉 omega（< 0 cw / > 0 ccw，遙控備援時用）
-//     rc[6] → 上下射轉速微調（< -10 → +5%，> +10 → -5%）
-//              開的時候轉速固定 50%（不隨通道值變動）
+//   Shoot（同時為馬達總開關）：
+//     rc[4] → 馬達總開關 ≥ 0 → 開（投射輪 + Storage ESC），< 0 → 停（已反相）
+//     rc[6] 已停用：上下射轉速固定 50%，不再微調
 //
 //   Storage:
 //     rc[8] → trigger        0/1（< 0 視為 1）
 //     （motorChannel / sw 本版保留未使用）
 //
-//   ⚠ rc[6] 目前同時被 Move 的 omega 與 Shoot 的轉速微調使用（見 RcMap::OMEGA）。
-//     若只拿來微調上下射轉速，請把 OMEGA 改成另一個空通道。
 // ============================================================================
 
 // 死區門檻（單一來源）：rc_channels[] 是 -100~100 的整數刻度。
@@ -474,6 +502,10 @@ static void forwardAllSlaves(const ControlPacket &pkt) {
 // 邊界語意：MathUtils::deadband 用嚴格不等式（|v| < db → 0），
 // 所以 -10 / +10 仍是有效值，-9 / +9 才是 0。
 static constexpr int16_t RC_DEADBAND = 10;
+
+// 遙控器實際極限（ELRS 實測滿推桿只到 ±97，不到刻度滿值 ±100）。
+// 重新映射以此為滿刻度基準，讓 97 正好對應 fullRange，不吃 3.3% 損失。
+static constexpr int16_t RC_MAX = 97;
 
 // 將 rc_channels[] 值映射為 int8（含死區 + 限幅）
 static int8_t rcToInt8(int16_t rcVal) {
@@ -492,21 +524,21 @@ static int8_t rcToInt8(int16_t rcVal) {
 // RcMap：rc_channels[] 索引（就是 rc[0]~rc[9] 的 0-based 索引）
 //   VX              = rc[0] → 左右平移
 //   VY              = rc[1] → 前後
-//   OMEGA           = rc[6] → cw/ccw 旋轉
-//   STORAGE_TRIGGER = rc[7] → < 0 觸發機構
+//   OMEGA           = rc[7] → cw/ccw 旋轉
+//   STORAGE_TRIGGER = rc[8] → < 0 觸發機構
 //         若你的旋轉改插別的通道，把 OMEGA 換成對應的 0-based 索引即可。
 // （2026 全改版）對應表：
-//   rc[4] = 馬達總開關   rc[5] = 來源切換   rc[6] = 射轉速微調
+//   rc[4] = 馬達總開關（≥ 0 開 / < 0 停）  rc[5] = 來源切換  rc[6] = 已停用
 //   rc[7] = 底盤 omega   rc[8] = trigger    rc[9] = 未使用
 namespace RcMap {
 constexpr uint8_t VX = 0;    // rc[0]
 constexpr uint8_t VY = 1;    // rc[1]
-// 馬達總開關：< 0 → 開（Move 四輪 + Shoot 投射輪），≥ 0 → 全部停
+// 馬達總開關：≥ 0 → 開（Shoot 投射輪 + Storage ESC），< 0 → 全部停
+// （2026 反相：原為 < 0 開 / ≥ 0 停）
 constexpr uint8_t SHOOT_ENABLE = 4; // rc[4]
 // 控制來源切換：< -10 → 遙控優先（強制走 RC），其餘 → Jetson 優先
 constexpr uint8_t SOURCE_SELECT = 5; // rc[5]
-// 上下射轉速微調：< -10 → +5%，> +10 → -5%（上下兩顆同時）
-constexpr uint8_t SHOOT_SPEED = 6; // rc[6]
+// rc[6] 已停用：上下射轉速固定 BASE_PCT（不再微調）
 constexpr uint8_t OMEGA = 7; // rc[7] → 底盤 cw/ccw 旋轉
 // Storage 機構觸發：< 0 就開始「全部通道跑一次」（Storage 端做上緣觸發）
 constexpr uint8_t STORAGE_TRIGGER = 8; // rc[8]
@@ -540,7 +572,7 @@ static int8_t rcAxisToWire(int16_t rcVal, float fullRange, int8_t sign = 1) {
     const float v = static_cast<float>(MathUtils::deadband(rcVal, RC_DEADBAND));
     if(v == 0.0f)
         return 0;
-    const float span = 100.0f - RcMoveCfg::DEADBAND;
+    const float span = static_cast<float>(RC_MAX) - RcMoveCfg::DEADBAND;
     const float mag = MathUtils::clampf(
         (fabsf(v) - RcMoveCfg::DEADBAND) / span, 0.0f, 1.0f);
     return rpsToWire((v > 0.0f ? mag : -mag) * fullRange *
@@ -581,8 +613,8 @@ static ControlPacket rcToMovePacket() {
 // 通道對照（rc[N]，N = 0~9）：
 //   rc[2] → pitch  上下仰角
 //   rc[3] → row    左右水平
-//   rc[4] → 投射輪啟停：< 0 → 開，≥ 0 → 0（停轉）
-//   rc[6] → 上下射轉速微調（上下兩顆同時，範圍 0~100%）
+//   rc[4] → 投射輪啟停：≥ 0 → 開（固定轉速），< 0 → 0（停轉）
+//   rc[6] 已停用（上下射轉速固定值，不再微調）
 //
 //   ⚠ 舊版把 rc[1]（前後移動）同時灌進 up/down 兩顆無刷：
 //     推前進時發射馬達也跟著轉，瞬間大電流造成電壓下陷 → 四輪出力不一致
@@ -593,39 +625,15 @@ static ControlPacket rcToMovePacket() {
 static constexpr bool RC_FORWARD_SHOOT = true;
 
 // ============================================================================
-// 上下射轉速＝固定基準 50% + rc[6] 微調
-//
-//   rc[6] < -10 → 每「觸發一次」+5%（增轉速）
-//   rc[6] > +10 → 每「觸發一次」-5%（減轉速）
-//   觸發一次 = 方向邊緣（從中立/反向進入 <-10 或 >10 的那一次）
-//   若希望「按住就連續微調」，把 HOLD_REPEAT_MS 設成 > 0（例如 250ms）
-//
-//   微調量與基準分開存（TRIM），所以拉到 100% 後不會「吃掉」步數：
-//   回推同樣次數就回到 50%。上下兩顆無刷永遠同一個值。
+// 上下射轉速＝固定值（rc[6] 微調功能已移除，上下兩顆永遠同一個值）
 // ============================================================================
 namespace RcShootCfg {
-constexpr int16_t BASE_PCT = 50;       // 固定基準轉速 (%)
-constexpr int16_t STEP_PCT = 5;        // 每次微調量 (%)
-constexpr int16_t TRIM_MIN = -50;      // 微調下限 → 50-50 = 0%
-constexpr int16_t TRIM_MAX = +50;      // 微調上限 → 50+50 = 100%
-constexpr int16_t DEADBAND = 10;       // |rc| <= 10 視為中立（不動作）
-constexpr uint32_t HOLD_REPEAT_MS = 0; // 0 = 只做方向邊緣觸發
+constexpr int16_t BASE_PCT = 50; // 固定基準轉速 (%)
 } // namespace RcShootCfg
 
-static int16_t sShootTrim = 0;    // 微調量 (%)，Core 0 專用
-static int16_t sShootStepDir = 0; // 上次方向：-1 增 / +1 減 / 0 中立
-static uint32_t sShootStepMs = 0; // 上次步進時間（HOLD_REPEAT_MS 用）
-
-// 清掉「方向邊緣」狀態，讓下次進入任一方向都算新的一次觸發
-// （控制來源切換時呼叫，避免殘留的半次步進跨模式生效）
-static void resetRcShootStepState() {
-    sShootStepDir = 0;
-    sShootStepMs = 0;
-}
-
-// 目前上下射轉速 (%)：固定 50% + 微調，限幅 0~100
+// 目前上下射轉速 (%)：固定值，限幅 0~100
 static int16_t rcShootSpeedPct() {
-    int16_t pct = RcShootCfg::BASE_PCT + sShootTrim;
+    int16_t pct = RcShootCfg::BASE_PCT;
     if(pct < 0)
         pct = 0;
     if(pct > 100)
@@ -634,42 +642,7 @@ static int16_t rcShootSpeedPct() {
 }
 
 // 讀 rc_channels[6] 並依邊緣（或按住）步進微調量
-static void updateRcShootSpeed() {
-    const int16_t rc = rc_channels[RcMap::SHOOT_SPEED];
-    int16_t dir = 0;
-    if(rc < -RcShootCfg::DEADBAND)
-        dir = -1; // 增轉速
-    else if(rc > RcShootCfg::DEADBAND)
-        dir = +1; // 減轉速
-
-    if(dir == 0) { // 回中立：下次進入任一方向都算新的一次觸發
-        sShootStepDir = 0;
-        return;
-    }
-
-    const uint32_t nowMs = millis();
-    bool doStep = (dir != sShootStepDir); // 方向邊緣 → 立即一步
-    if(!doStep && RcShootCfg::HOLD_REPEAT_MS > 0 &&
-       (nowMs - sShootStepMs) >= RcShootCfg::HOLD_REPEAT_MS)
-        doStep = true; // 按住連續微調
-    sShootStepDir = dir;
-    if(!doStep)
-        return;
-    sShootStepMs = nowMs;
-
-    sShootTrim += (dir < 0) ? RcShootCfg::STEP_PCT : -RcShootCfg::STEP_PCT;
-    if(sShootTrim < RcShootCfg::TRIM_MIN)
-        sShootTrim = RcShootCfg::TRIM_MIN;
-    if(sShootTrim > RcShootCfg::TRIM_MAX)
-        sShootTrim = RcShootCfg::TRIM_MAX;
-
-    (void)rc;
-}
-
 static ControlPacket rcToShootPacket() {
-    // 先依 rc_channels[6] 更新微調（邊緣觸發，100Hz 呼叫也只會走一次）
-    updateRcShootSpeed();
-
     ControlPacket pkt = {};
     pkt.sync = 0xA5;
     pkt.msgType = MsgType::CONTROL;
@@ -677,10 +650,10 @@ static ControlPacket rcToShootPacket() {
     pkt.targetID = TargetID::SHOOT;
     pkt.payloadLen = sizeof(ControlPacket) - 6 - 2;
 
-    // rc_channels[4] < 0 → 開啟（固定 50% + 微調）；≥ 0 → 0
+    // rc_channels[4] ≥ 0 → 開啟（固定轉速）；< 0 → 0
     // （Shoot 端 0 = 1500µs 中立、停轉；速度會寫入 EEPROM 並即時套用）
     const int8_t shootSpeed =
-        (rc_channels[RcMap::SHOOT_ENABLE] < 0)
+        (rc_channels[RcMap::SHOOT_ENABLE] >= 0)
             ? static_cast<int8_t>(rcShootSpeedPct())
             : static_cast<int8_t>(0);
     pkt.shoot.upSpeed = shootSpeed;
@@ -697,9 +670,9 @@ static ControlPacket rcToShootPacket() {
 // ============================================================================
 // RC → Storage ControlPacket
 //
-//   rc[7] < 0 → trigger=1，Storage 在「上緣」觸發
+//   rc[8] < 0 → trigger=1，Storage 在「上緣」觸發
 //                 全部已啟用伺服通道跑一次循環
-//   rc[7] ≥ 0 → trigger=0（Storage 停止並全部回 HOME）
+//   rc[8] ≥ 0 → trigger=0（Storage 停止並全部回 HOME）
 //
 // motorChannel / sw 本版 Storage 不使用，固定填 0。
 // ============================================================================
@@ -714,8 +687,8 @@ static ControlPacket rcToStoragePacket() {
     pkt.payloadLen = sizeof(ControlPacket) - 6 - 2;
 
     pkt.storage.motorChannel = 0; // 本版不使用
-    // rc[4] 馬達總開關：< 0 → 開（Storage ESC 轉），≥ 0 → 停
-    pkt.storage.sw = (rc_channels[RcMap::SHOOT_ENABLE] < 0) ? 1 : 0;
+    // rc[4] 馬達總開關：≥ 0 → 開（Storage ESC 轉），< 0 → 停（已反相）
+    pkt.storage.sw = (rc_channels[RcMap::SHOOT_ENABLE] >= 0) ? 1 : 0;
     pkt.storage.trigger = (rc_channels[RcMap::STORAGE_TRIGGER] < 0) ? 1 : 0;
     pkt.storage.row = rcToInt8(rc_channels[3]);
 
@@ -726,23 +699,36 @@ static ControlPacket rcToStoragePacket() {
 }
 
 // ============================================================================
-// 控制來源切換（rc[5]）
+// 控制來源切換（rc[5] + GP14 按鈕）
 //
-//   值 < -10 → 遙控接管：即使 Jetson 還在送幀，也一律走 RC 路徑
-//   其餘      → Jetson 持有全部控制權（Jetson 逾時 >500ms 才自動切 RC 備援）
+//   遙控穩定在線時：
+//     rc[5] < -10 → 遙控接管：即使 Jetson 還在送幀，也一律走 RC 路徑
+//     其餘        → Jetson 持有全部控制權（Jetson 逾時 >500ms 才自動切 RC 備援）
 //
-//   安全：遙控本身 Failsafe 時 rcSourceOverrideRequested() 回 false，
-//         避免遙控斷線後鎖死在 RC；此時若 Jetson 也在線就交回 Jetson，
-//         若 Jetson 也逾時則由 tryRcFallback() 送 E-Stop 廣播。
+//   遙控「真的斷線」（failsafe 連續 > RC_LINK_LOST_MS）時：
+//     按下 GP14 按鈕 → 鎖存改由 Jetson 控制（JETSON_BTN）
+//     沒按          → 維持 RC_FALLBACK（持續送 E-Stop 廣播）
+//   遙控恢復連線 → 自動解除鎖存，回到 rc[5] 判斷。
+//
+//   短暫斷線（< RC_LINK_LOST_MS）：rc_channels 凍結在最後一次值，
+//   模式不切換、不送 E-Stop，避免抖動。
 // ============================================================================
 static bool rcSourceOverrideRequested() {
-    if(rc_failsafe)
+    // 短暫斷線仍視為在線；rc_channels 凍結在斷線前的值 → 模式自動保持
+    if(!rcLinkUp)
         return false;
     return rc_channels[RcMap::SOURCE_SELECT] < RcMap::SOURCE_RC_THRESHOLD;
 }
 
 // 每圈 loop() 只呼叫一次：算出本輪唯一的控制來源
 static ControlSource evaluateControlSource(uint64_t nowUs) {
+    // 遙控真的斷線（曾連上過）→ 只能等按鈕或恢復連線
+    if(rcEverSeen && !rcLinkUp) {
+        if(gBtnJetsonLatched)
+            return ControlSource::JETSON_BTN;
+        return ControlSource::RC_FALLBACK;
+    }
+
     if(rcSourceOverrideRequested())
         return ControlSource::RC_SWITCH;
     if(nowUs - lastJetsonFrameUs > RobotConfig::HEARTBEAT_TIMEOUT_US)
@@ -756,6 +742,8 @@ static const char *controlSourceName(ControlSource s) {
         return "RC-switch  ";
     case ControlSource::RC_FALLBACK:
         return "RC-timeout ";
+    case ControlSource::JETSON_BTN:
+        return "JETSON-btn ";
     case ControlSource::JETSON:
     default:
         return "JETSON    ";
@@ -763,9 +751,8 @@ static const char *controlSourceName(ControlSource s) {
 }
 
 // 來源切換時清掉「只屬於 RC 模式」的暫態，避免殘留進 Jetson 模式。
-// （Shoot 轉速微調量 sShootTrim 刻意保留：下次切回遙控時接續上次的值）
+// （Shoot 轉速為固定值，無暫態需要保留）
 static void onControlSourceChanged(ControlSource from, ControlSource to) {
-    resetRcShootStepState();
     (void)from;
     (void)to;
     // 序列輸出已簡化：不印切換訊息，狀態只顯示在主行 src 欄位
@@ -784,8 +771,10 @@ static void onJetsonFrame(const ControlPacket &pkt) {
         jetsonFrameCount++;
 
     // 非 Jetson 模式（遙控開關接管 / Jetson 逾時備援）→ 丟棄 Jetson 命令。
+    // JETSON_BTN（按鈕鎖存的 Jetson 控制）視同 Jetson 模式，命令照轉。
     // 仍更新時間戳（上面），這樣切回 Jetson 模式時可立即判定 Jetson 是否還在線。
-    if(gSource != ControlSource::JETSON) {
+    if(gSource != ControlSource::JETSON &&
+       gSource != ControlSource::JETSON_BTN) {
         if(jetsonDroppedCount < UINT32_MAX)
             jetsonDroppedCount++;
         return;
@@ -822,8 +811,8 @@ static void tryRcFallback() {
         return;
     lastRcForwardUs = now;
 
-    // 如果遙控也斷線 → E-Stop 廣播
-    if(rc_failsafe) {
+    // 如果遙控「真的斷線」（短暫斷線時凍結最後命令，不送 E-Stop）→ E-Stop 廣播
+    if(!rcLinkUp) {
         ControlPacket estop = {};
         estop.sync = 0xA5;
         estop.msgType = MsgType::ESTOP;
@@ -860,17 +849,16 @@ static void tryRcFallback() {
             lastShootDbgUs = nowShoot;
             Serial.printf("[HUB] → Shoot pitch=%d row=%d "
                           "(rc[2]=%d rc[3]=%d) "
-                          "up=%d down=%d (rc[4]=%d rc[6]=%d)\n",
+                          "up=%d down=%d (rc[4]=%d)\n",
                           sh.shoot.pitch, sh.shoot.row, rc_channels[2],
                           rc_channels[3], sh.shoot.upSpeed,
                           sh.shoot.downSpeed,
-                          static_cast<int>(rc_channels[RcMap::SHOOT_ENABLE]),
-                          static_cast<int>(rc_channels[RcMap::SHOOT_SPEED]));
+                          static_cast<int>(rc_channels[RcMap::SHOOT_ENABLE]));
         }
     }
 
     // 遙控正常 → 轉發控制幀給 Storage（PIO SM2, GP6 TX / GP7 RX）
-    // rc[7] < 0 → trigger=1，
+    // rc[8] < 0 → trigger=1，
     // Storage 端以上緣觸發「全部通道跑一次」
     if(RC_FORWARD_STORAGE) {
         ControlPacket st = rcToStoragePacket();
@@ -923,6 +911,51 @@ static void tryRcFallback() {
 }
 
 // ============================================================================
+// Core 0：GP14 按鈕讀取（防彈跳）+ RC 連線穩態過濾
+//
+// 按鈕：按下（LOW）持續超過 DEBOUNCE_MS 才確認。在遙控「真的斷線」期間
+//       按下 → 鎖存 Jetson 控制；遙控恢復連線時自動清除鎖存。
+//
+// RC 連線：crsf failsafe 連續超過 RC_LINK_LOST_MS 才視為真的斷線。
+//          短暫斷線期間 rcLinkUp 維持 true，rc_channels 凍結在最後值，
+//          控制模式不切換、不送 E-Stop。
+// ============================================================================
+static void updateButtonAndRcLink(uint32_t nowMs, uint64_t nowUs) {
+    // ---- 按鈕防彈跳 ----
+    const int raw = digitalRead(BtnCfg::PIN);
+    if(raw != btnStableLevel) {
+        if(nowMs - btnLastChangeMs >= BtnCfg::DEBOUNCE_MS) {
+            btnStableLevel = static_cast<bool>(raw);
+            btnLastChangeMs = nowMs;
+        }
+    } else {
+        btnLastChangeMs = nowMs;
+    }
+    const bool btnPressed = (btnStableLevel == LOW);
+
+    // ---- RC 連線穩態過濾 ----
+    if(crsf.getFrameCount() > 0)
+        rcEverSeen = true;
+
+    if(!rc_failsafe) {
+        rcLostSinceUs = 0;
+        rcLinkUp = true;
+        // 遙控恢復連線 → 清除按鈕鎖存，回到 rc[5] 判斷
+        gBtnJetsonLatched = false;
+    } else {
+        if(rcLostSinceUs == 0)
+            rcLostSinceUs = nowUs;
+        if(nowUs - rcLostSinceUs >
+           static_cast<uint64_t>(BtnCfg::RC_LINK_LOST_MS) * 1000ULL) {
+            rcLinkUp = false;
+            // 真的斷線期間按鈕 → 鎖存改為 Jetson 控制
+            if(btnPressed)
+                gBtnJetsonLatched = true;
+        }
+    }
+}
+
+// ============================================================================
 // Core 0：setup()
 // ============================================================================
 void setup() {
@@ -947,6 +980,11 @@ void setup() {
 
     // 初始化 Jetson 逾時追蹤
     lastJetsonFrameUs = time_us_64();
+
+    // GP14 按鈕（另一端接 GND，內部上拉，按下 = LOW）
+    pinMode(BtnCfg::PIN, INPUT_PULLUP);
+    btnStableLevel = HIGH;
+    btnLastChangeMs = millis();
 
     // 狀態 LED
     statusLed.begin();
@@ -974,10 +1012,14 @@ void loop() {
 
     uint64_t now = time_us_64();
 
+    // ---- 按鈕 + RC 連線穩態更新（在評估控制來源之前）----
+    updateButtonAndRcLink(millis(), now);
+
     // ---- 控制來源：每圈只算一次，全域單一真相 ----
     //   JETSON      → 所有 Slave 全部聽 Jetson；遙控器只讀 rc[5] 開關
     //   RC_SWITCH   → rc[5] 切到遙控邊，遙控接管全部 Slave
     //   RC_FALLBACK → Jetson 逾時 >500ms 自動備援
+    //   JETSON_BTN  → 遙控真的斷線時按下 GP14 按鈕，鎖存改為 Jetson 控制
     const ControlSource src = evaluateControlSource(now);
     if(src != gSource) {
         onControlSourceChanged(gSource, src);
@@ -987,8 +1029,10 @@ void loop() {
     // 狀態 LED：必須在 gSource 決定後才更新（狀態機要用本圈的控制來源）
     updateStatusLed();
 
-    // 只有非 Jetson 模式才會產生任何 RC 命令（Jetson 模式完全碰不到 RC 值）
-    if(gSource != ControlSource::JETSON)
+    // 只有 RC 模式才會產生 RC 命令
+    // （JETSON / JETSON_BTN 模式完全碰不到 RC 值；JETSON_BTN 的命令來自 Jetson）
+    if(gSource == ControlSource::RC_SWITCH ||
+       gSource == ControlSource::RC_FALLBACK)
         tryRcFallback();
 
     // ---- 序列輸出：每 500ms 只印一行 RC 通道數據 ----

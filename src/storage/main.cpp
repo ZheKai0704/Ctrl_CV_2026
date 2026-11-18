@@ -233,13 +233,13 @@ struct ServoProfile {
 };
 
 constexpr ServoProfile PROFILE[Pca9685Reg::CHANNEL_COUNT] = {
-    /* CH0  */ {30.0f, 110.0f, false},
-    /* CH1  */ {30.0f, 100.0f, false},
+    /* CH0  */ {45.0f, 120.0f, false},
+    /* CH1  */ {30.0f, 120.0f, false},
     /* CH2  */ {25.0f, 110.0f, false},
-    /* CH3  */ {30.0f, 110.0f, false},
+    /* CH3  */ {33.0f, 120.0f, false},
     /* CH4  */ {30.0f, 110.0f, false},
     /* CH5  */ {30.0f, 110.0f, false},
-    /* CH6  */ {80.0f, 30.0f, false}, // 追加動作那顆：平常 75° → 打到 30°
+    /* CH6  */ {90.0f, 25.0f, false}, // 追加動作那顆：平常 75° → 打到 30°
     /* CH7  */ {30.0f, 110.0f, false},
     /* CH8  */ {30.0f, 110.0f, false},
     /* CH9  */ {30.0f, 110.0f, false},
@@ -263,13 +263,17 @@ inline float activeDeg(uint8_t ch) {
     return p.reverse ? p.startDeg : p.endDeg;
 }
 
-constexpr uint32_t DWELL_MS = 1000; // 作動角度停留
+constexpr uint32_t DWELL_MS = 500; // 作動角度停留
 constexpr uint32_t SETTLE_MS = 500; // 回待機角度後等待，再換下一顆
 
 // trigger 一次要做動的「組」順序（組 n = CH(2n), CH(2n+1)）
 // 每組連續作動 REPEAT_PER_GROUP 次，每次 = 組內每顆依序 OUT → HOME。
 // 按一次 trigger 只執行「一個動作」（一組的一次），全部共 30 次。
-constexpr uint8_t GROUP_ORDER[] = {2, 5, 1, 6, 0, 7};
+constexpr uint8_t GROUP_ORDER[] = {2, 5, 6, 7, 1, 0};
+// 個別組的 dwell 覆寫：GROUP_ORDER 中值為 0 或 1 的組停留較久
+// （組 0 = CH0/CH1、組 1 = CH2/CH3）
+constexpr uint32_t GROUP0_DWELL_MS = 1000;
+constexpr uint32_t GROUP1_DWELL_MS = 1000;
 constexpr uint8_t GROUP_ORDER_COUNT =
     sizeof(GROUP_ORDER) / sizeof(GROUP_ORDER[0]);
 constexpr uint8_t REPEAT_PER_GROUP = 5;
@@ -283,7 +287,7 @@ constexpr uint8_t STEPS_PER_ACTION = GROUP_CHANNELS; // 一次動作最多兩顆
 //   平常停在 restDeg(6) = 75°，主序列做完 → 打到 activeDeg(6) = 30°
 //   → 停留 POST_DWELL_MS → 回 75°，然後才等下一個 trigger。
 constexpr uint8_t POST_CHANNEL = 6;
-constexpr uint32_t POST_DWELL_MS = 1000; // 停在作動角度的時間
+constexpr uint32_t POST_DWELL_MS = 700; // 停在作動角度的時間
 // CH6 一律要驅動：它不在主序列內，常常是 EEPROM 校正裡沒被 enable 的那顆。
 // 若照 EEPROM 的 enabled 跳過，它就只會被寫成 full-OFF（輸出恆低 = 沒有脈衝），
 // 實際上有接伺服的∏就是「不動作 + 一直嗡嗡抖」的來源。
@@ -611,6 +615,10 @@ static void startNext() {
             currentAction = action;
             currentGroup = group;
             currentRep = repOfAction(action);
+            // 組 0 / 組 1 停留時間覆寫，其餘組用預設 DWELL_MS
+            dwellMs = (group == 0)   ? SeqCfg::GROUP0_DWELL_MS
+                      : (group == 1) ? SeqCfg::GROUP1_DWELL_MS
+                                     : SeqCfg::DWELL_MS;
             running = true;
             phase = PHASE_OUT;
             phaseMs = millis();
@@ -980,7 +988,32 @@ constexpr float MIN_SPS = 330.0f;          // 起步/收尾速率（PIO clkdiv �
 constexpr uint32_t DIR_SETTLE_US = 20;     // DIR 建立時間
 constexpr uint32_t RAMP_INTERVAL_US = 100; // 加減速更新週期（100µs）
 
+// ---- 干擾防護 ----
+// 開機靜默期：前 BOOT_HOLD_MS 忽略 row 動作（PCA9685 初始化 + ESC arming 這段
+// 供電最不穩，指令/雜訊造成的起動看起來就像「開機自轉」）。目標值照樣記錄，
+// 靜默期結束後才補走到位。
+constexpr uint32_t BOOT_HOLD_MS = 4000;
+// row 輸入死區（-97~97 刻度）：微抖不動，避免搖桿/雜訊造成微量轉動
+constexpr float INPUT_DEADBAND = 3.0f;
+// 小於此步數的位移差直接忽略（約滿行程 1.7%）：E-Stop 回補估算誤差、
+// 單幀雜訊 row 值跳動，都不會再讓馬達「跳一點位置」
+constexpr int32_t MIN_MOVE_STEPS = 40;
+// E-Stop 觸發次數（診斷用：rc[4] 開關時若一直增加，代表 ESC 湧浪
+// 把 UART 幀打掉 >100ms → E-Stop，是供電/EMI 問題不是遙輯問題）
+static volatile uint32_t sEstopCount = 0;
+
+// ---- row 目標雜訊濾波 ----
+// 實測：無刷運轉時 rc[3] 命令會高頻振盪 ±10~30（每幀都變、正負交替），
+// 每個雜訊值直接成新目標就會造成 ±數百步的偏移自轉。
+// EMA 低通：高頻振盪被平均掉（振幅 < INPUT_DEADBAND → 歸零），
+// 真實搖桿操作是持續同方向的，只延遲約 60ms（@100Hz）。
+constexpr float ROW_EMA_ALPHA = 0.15f;
+static float sFiltInput = 0.0f;   // EMA 後的輸入（-97~97）
+static bool sFiltInit = false;    // 首次命令直接貼齊，不等 EMA 收斂
+
 static int32_t refSteps = 0;        // 目前位置估算（steps，0 = 上電位置）
+static bool sHoldAfterEstop = false; // E-Stop 後不自動補走，等新 row 命令才動
+static bool sInEstop = false;        // 目前是否處在 E-Stop 中（計數去重用）
 static int32_t targetSteps = 0;     // 命令目標（steps）
 static int32_t planTargetSteps = 0; // 本次動作的目標（動作中不變）
 static float planSteps = 0.0f;      // 本次動作總步數（正值）
@@ -1018,12 +1051,22 @@ static int32_t inputToSteps(float input) {
     if(input < -AxisConfig::INPUT_LIMIT) {
         input = -AxisConfig::INPUT_LIMIT;
     }
+    // 輸入死區：|input| < INPUT_DEADBAND → 0（搖桿微抖/單幀雜訊不動）
+    if(fabsf(input) < INPUT_DEADBAND)
+        input = 0.0f;
     // -97~+97 → -2400~+2400 steps
     return static_cast<int32_t>(roundf(input * STEP_PER_INPUT * INPUT_SIGN));
 }
 
 void init() {
     sClkSysHz = static_cast<float>(clock_get_hz(clk_sys));
+
+    // 安全狀態先行：STEP/DIR/EN 三支腳在上電後立刻輸出確定電位。
+    // （先前 STEP 在 PIO 設定完成前是浮接輸入，驅動器光耦合輸入吃到雜訊
+    //   就會產生脈衝 → 「開機自轉」。）
+    gpio_init(Pin::ROW_STEP);
+    gpio_set_dir(Pin::ROW_STEP, GPIO_OUT);
+    gpio_put(Pin::ROW_STEP, 0); // STEP 閒置 = 低
 
     gpio_init(Pin::ROW_DIR);
     gpio_set_dir(Pin::ROW_DIR, GPIO_OUT);
@@ -1036,6 +1079,7 @@ void init() {
     int smIdx = pio_claim_unused_sm(sPio, false);
     if(smIdx < 0) {
         pioReady = false;
+        // PIO 取得失敗也保持 STEP 由 CPU 驅動為低，絕不浮接
         return;
     }
     sSm = static_cast<uint>(smIdx);
@@ -1101,7 +1145,26 @@ static void startSegment(int32_t steps) {
 
 /// 設定目標（input -97~97）。Core 1 context。
 void setTarget(float input) {
-    int32_t s = inputToSteps(input);
+    if(input > AxisConfig::INPUT_LIMIT) {
+        input = AxisConfig::INPUT_LIMIT;
+    }
+    if(input < -AxisConfig::INPUT_LIMIT) {
+        input = -AxisConfig::INPUT_LIMIT;
+    }
+
+    // EMA 低通濾波：無刷運轉時 rc[3] 的高頻雜訊在此被平均掉
+    if(!sFiltInit) {
+        sFiltInit = true;
+        sFiltInput = input; // 第一個命令直接貼齊，不等 EMA 收斂
+    } else {
+        sFiltInput += (input - sFiltInput) * ROW_EMA_ALPHA;
+    }
+
+    int32_t s = inputToSteps(sFiltInput);
+    // 收到「不同的」新目標 → 解除 E-Stop 後的補走鎖定
+    // （同一個值每控制幀都會重送，不算新命令）
+    if(s != targetSteps)
+        sHoldAfterEstop = false;
     // 行程限制：以中間（0 步）為原點，前 / 後各最多 2400 步
     if(s > STEP_LIMIT_FRONT)
         s = STEP_LIMIT_FRONT;
@@ -1113,14 +1176,29 @@ void setTarget(float input) {
 /// 目前命令目標 / 位置估算（Core 1 context，供日誌與遙測讀取）
 int32_t targetStepsValue() { return targetSteps; }
 int32_t refStepsValue() { return refSteps; }
+float filteredInputValue() { return sFiltInput; } // 診斷：濾波後的 row 輸入
 bool isMoving() { return moving; }
 
 /// idleHook：推進水平軸
 void update() {
     if(!moving) {
+        // E-Stop 後鎖定：等新的 row 命令（不同目標值）才解除
+        if(sHoldAfterEstop) {
+            return;
+        }
         int32_t diff = targetSteps - refSteps;
         if(diff == 0) {
             return; // 已到位，零開銷
+        }
+        // 小於 MIN_MOVE_STEPS 的位移差直接忽略：E-Stop 回補估算誤差
+        // 或雜訊 row 值只差幾十步時，不起動（看起來像「被干擾跳一點」的來源）
+        if(diff > -MIN_MOVE_STEPS && diff < MIN_MOVE_STEPS) {
+            refSteps = targetSteps; // 視為到位，位置估算直接貼齊目標
+            return;
+        }
+        // 開機靜默期：目標照樣記錄，但不動（供電最不穩的這段不起動）
+        if(millis() < BOOT_HOLD_MS) {
+            return;
         }
         startSegment(diff);
         return;
@@ -1168,7 +1246,11 @@ void update() {
     }
 }
 
-/// E-Stop：立即停止脈衝；保留命令目標，E-Stop 解除後自動補回原位
+/// E-Stop：立即停止脈衝。
+/// ⚠ 不再自動補走原位：ESC 湘浪/EMI 會讓 UART 反覆掉幀 → E-Stop 風暴，
+///   若解除後自動補走，馬達會陷入「轉 → E-Stop 停 → 補走 → 又 E-Stop」
+///   的循環，看起來就是無刷一轉步進就自轉。改為：E-Stop 後位置凍結，
+///   等收到「不同的」新 row 目標才會再動（setTarget 解除 sHoldAfterEstop）。
 void estop() {
     haltPulses();
     if(moving) {
@@ -1178,6 +1260,7 @@ void estop() {
     moving = false;
     curSps = 0.0f;
     estSteps = 0.0f;
+    sHoldAfterEstop = true;
 }
 
 int32_t positionSteps() { return moving ? refSteps : targetSteps; }
@@ -1192,12 +1275,44 @@ static MoveTelemetry pendingTm = {}; // Core 1 寫入 → Core 0 發送
 static void refreshTelemetry(); // 定義於下方
 
 static void onStorageEstop() {
+    // ⚠️ 本函式可能由 Core 0（SlaveComms::update() 的 100ms 逾時、或收到 ESTOP
+    //    廣播）與 Core 1（runCore1() 的 E-Stop 分支）兩邊呼叫。
+    //    SlaveComms 的 estopActive_ 分支本來就會在 Core 1 每圈呼叫 onEstop，
+    //    所以 Core 0 這邊的呼叫是冗餘的，而且若在 Core 0 執行
+    //    ServoSeq::stop() / goHomeAll() 會造成：
+    //      1. Core 0 做阻塞式 I2C（每次最長 ~60ms × 17 通道），與 Core 1
+    //         idleHook 的 I2C（holdRefresh / pollPostChannel / 序列寫入）並發
+    //         → 同一個 DW_apb_i2c 被兩顆核心同時驅動，匯流排可能整個卡死
+    //         （兩邊同時 busRecover 更會 i2c_deinit 與對方交易互踩）。
+    //      2. PCA9685 收到半截交易 → 暫存器被寫入垃圾（最壞 latch 到
+    //         FULL_ON，伺服撞機械極限堵轉）。
+    //      3. ServoSeq / chTarget* 等非原子共享狀態被雙核同時改寫。
+    //    因此 Core 0 只負責 ESC（無 I2C / 無共享狀態），其餘一律等 Core 1
+    //    自己的 E-Stop 分支處理。
+    if(get_core_num() == 0) {
+        EscOutput::setPercent(0); // E-Stop → ESC 停轉（純 PWM 暫存器，Core 0 安全）
+        return;
+    }
+
+    // ---- 以下只在 Core 1 執行 ----
+    // E-Stop 邊緣觸發（runCore1 的 E-Stop 分支每圈都會呼叫 onEstop，
+    // 不去重的話計數會暴增）。onStorageCommand 收到有效幀時清鎖存。
+    if(!RowStepper::sInEstop) {
+        RowStepper::sInEstop = true;
+        RowStepper::sEstopCount++;
+        static uint32_t sLastEstopLogMs = 0;
+        const uint32_t nowMs = millis();
+        if(nowMs - sLastEstopLogMs > 1000) {
+            sLastEstopLogMs = nowMs;
+            storageLog.printf("[STEP] E-Stop #%lu pos=%ld (無刷轉動時頻繁出現 = "
+                              "ESC 湘浪打掉 UART/供電不穩)",
+                              static_cast<unsigned long>(RowStepper::sEstopCount),
+                              static_cast<long>(RowStepper::refStepsValue()));
+        }
+    }
     MotorControl::estop();
     EscOutput::setPercent(0); // E-Stop → ESC 停轉
-    // 步進：只由 Core 1 操作 PIO（避免與 idleHook 同時改 PIO 暫存器）
-    if(get_core_num() == 1) {
-        RowStepper::estop();
-    }
+    RowStepper::estop();      // 步進：只由 Core 1 操作 PIO
     // ⚠️ E-Stop 期間 runCore1() 只會一直呼叫 onEstop，**idleHook 不會被呼叫**，
     //    所以守護刷新與遙測保活要在這裡也跑一次，否則長時間 E-Stop 時：
     //    - 晶片設定若被干擾就沒人修（伺服就把位置結在錯的地方）
@@ -1209,6 +1324,8 @@ static void onStorageEstop() {
 static void buildTelemetry(); // 定義於下方
 
 static void onStorageCommand(const ChassisSnapshot &cmd) {
+    // 收到有效控制幀 → E-Stop 已解除，清鎖存（下一次 E-Stop 再計一次）
+    RowStepper::sInEstop = false;
     MotorControl::executeMotion(cmd);
     // 無刷 ESC（GP13）：sw=1 → 轉（爬升到 SPEED_PCT），sw=0 → 停（0%）
     EscOutput::setPercent(cmd.sw ? EscOutput::SPEED_PCT : 0);
@@ -1217,7 +1334,9 @@ static void onStorageCommand(const ChassisSnapshot &cmd) {
     static int16_t sLastRow = 1000;
     if(cmd.row != sLastRow) {
         sLastRow = static_cast<int16_t>(cmd.row);
-        storageLog.printf("[ROW] 命令 %d", static_cast<int>(cmd.row));
+        // 同時印原始與濾波後值（×10 定點，避免 printf 浮點支援問題）
+        storageLog.printf("[ROW] 命令 %d 濾後 %d", static_cast<int>(cmd.row),
+                          static_cast<int>(RowStepper::filteredInputValue() * 10.0f));
     }
     buildTelemetry();
 }
@@ -1331,8 +1450,9 @@ static void updateStatusLed() {
 // Core 0
 // ============================================================================
 void setup() {
-    EscOutput::init(0); // ESC GP13 先維持 0%（停轉），等 Hub sw=1 才爬升轉速
+    // 步進腳位安全狀態最先設定（STEP/DIR/EN 上電立刻有確定電位，不浮接）
     RowStepper::init();                    // 水平 STEP/DIR/EN（PIO0 SM）
+    EscOutput::init(0); // ESC GP13 先維持 0%（停轉），等 Hub sw=1 才爬升轉速
     statusLed.begin();
     digitalWrite(LED_BUILTIN, HIGH); // 開機先亮（BOOT 狀態）
 
@@ -1372,14 +1492,15 @@ void loop() {
     if(nowMs - lastStatusMs >= 2000) {
         lastStatusMs = nowMs;
         Serial.printf("[STATUS] PCA err=%lu repair=%lu | STEP pos=%ld tgt=%ld %s | "
-                      "ESC %u%% | Hub cmd=%lu\n",
+                      "ESC %u%% | Hub cmd=%lu | estop=%lu\n",
                       static_cast<unsigned long>(sPca.errorCount()),
                       static_cast<unsigned long>(MotorControl::repairCount()),
                       static_cast<long>(RowStepper::refStepsValue()),
                       static_cast<long>(RowStepper::targetStepsValue()),
                       RowStepper::isMoving() ? "移動中" : "停止",
                       static_cast<unsigned>(EscOutput::currentPercent()),
-                      static_cast<unsigned long>(slave.validCmdCount()));
+                      static_cast<unsigned long>(slave.validCmdCount()),
+                      static_cast<unsigned long>(RowStepper::sEstopCount));
     }
 }
 

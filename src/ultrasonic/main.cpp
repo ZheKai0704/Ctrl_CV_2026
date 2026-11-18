@@ -219,6 +219,10 @@ static uint g_pio1Offset = 0;
 // 30 ms 回音的最大計數：約 1,875,000 < 2^31，uint32 安全。
 // ============================================================================
 static constexpr int32_t SOUND_SPEED_M_S = 338; // 音速（m/s），實測校準
+// 量程硬防線（防跳變疊加 #1）：超過此值的 count 一律視為陳舊/雜訊直接丟棄，
+// 不進 median 濾波器。只檔掉物理上不可能的跨週期值（如 11097mm），
+// 不會影響任何真實回音（PIO 硬體逾時上限 ~5.4m 對應 32ms）。
+static constexpr uint32_t MAX_RANGE_MM = 5400U;
 static uint32_t rawCountToMm(uint32_t count, int sensorIdx) {
     // d_mm = count * 音速 / 125000（先算原始距離 mm，再扣該顆感測器的校準偏移）
     const int32_t mm = static_cast<int32_t>(
@@ -246,6 +250,12 @@ static bool g_cycleValid[SENSOR_COUNT];
 static constexpr int CONSECUTIVE_FAIL_LIMIT = 3; // 約 3 個量測週期 ≈ 200ms
 static int g_failCount[SENSOR_COUNT];
 
+// 防跳變疊加 #2 機制：本輪 rearm 時從 RX FIFO 捡回的「遲到真值」。
+// 遠距/弱回音時 echo 常在 30ms 期限之後才完成 push（HEAD 靠這個
+// 保住遠距讀值）；rearm 排空時若值在量程內則預設為本輪有效數據，
+// 超過量程（> MAX_RANGE_MM，如 11097 跨週期污染）直接丟棄。
+static bool g_latePreset[SENSOR_COUNT];
+
 // ============================================================================
 // 分組觸發 — active-LOW 觸發。
 // 已診斷確認：這顆 US-100 的 Trigger 是「閒置 HIGH、拉 LOW」觸發
@@ -271,8 +281,26 @@ static void fireGroupTrigger(SensorGroup group) {
 // ============================================================================
 static void rearmGroupSMs(SensorGroup group) {
     for(int i = 0; i < SENSOR_COUNT; i++) {
-        if(sensorConfigs[i].group == group)
-            ultrasonic_echo_trigger(sensorConfigs[i].pio, sensorConfigs[i].sm);
+        if(sensorConfigs[i].group != group)
+            continue;
+        // 防跳變疊加 #2：rearm 前排空 RX FIFO，但先「捡回」遲到真值。
+        // 遠距/弱回音時 echo 常在 30ms 期限後才完成 push（HEAD 靠這個
+        // 保住遠距讀值）；殘值在量程內 → 預設為本輪有效數據
+        // （collectGroupResults 若收到更新的鮮值會覆寫）；
+        // 超過量程（如 11097 跨週期污染）→ 丟棄。
+        PIO pio = sensorConfigs[i].pio;
+        uint sm = sensorConfigs[i].sm;
+        uint32_t lastVal = 0;
+        while(!pio_sm_is_rx_fifo_empty(pio, sm)) {
+            lastVal = pio_sm_get(pio, sm);
+        }
+        if(lastVal > 0 &&
+           rawCountToMm(lastVal, i) <= MAX_RANGE_MM) {
+            g_rawCount[i] = lastVal;
+            g_cycleValid[i] = true;
+            g_latePreset[i] = true;
+        }
+        ultrasonic_echo_trigger(pio, sm);
     }
 }
 
@@ -325,7 +353,9 @@ static void collectGroupResults(SensorGroup group) {
 
     // 超過 30ms 截止時間仍有感測器沒回應
     for(int i = 0; i < SENSOR_COUNT; i++) {
-        if(!done[i] && sensorConfigs[i].group == group) {
+        if(!done[i] && sensorConfigs[i].group == group && !g_latePreset[i]) {
+            // g_latePreset：本輪 rearm 時已捡回遲到真值，不清除，
+            // 讓它參與本輪濾波。
             g_rawCount[i] = 0;
             g_cycleValid[i] = false;
 
@@ -339,9 +369,11 @@ static void collectGroupResults(SensorGroup group) {
 // 全部 6 顆感測器的一個完整量測週期
 // ============================================================================
 static void doMeasurementCycle() {
-    // 本輪原始有效性旗標預設為失敗，由 collect 更新
-    for(int i = 0; i < SENSOR_COUNT; i++)
+    // 本輪原始有效性旗標預設為失敗，由 collect/rearm 更新
+    for(int i = 0; i < SENSOR_COUNT; i++) {
         g_cycleValid[i] = false;
+        g_latePreset[i] = false;
+    }
 
     // ---- Phase 1: Group A ----
     rearmGroupSMs(GROUP_A); // 1. 釋放 PIO 的 pull 阻塞，讓 PIO 開始準備監聽
@@ -356,7 +388,8 @@ static void doMeasurementCycle() {
 
     // 更新中位數濾波器 + 無效容忍邏輯
     for(int i = 0; i < SENSOR_COUNT; i++) {
-        if(g_cycleValid[i] && g_rawCount[i] > 0) {
+        if(g_cycleValid[i] && g_rawCount[i] > 0 &&
+           rawCountToMm(g_rawCount[i], i) <= MAX_RANGE_MM) {
             // 本輪成功：重置失敗計數，標記有效，插入濾波器並更新距離
             g_failCount[i] = 0;
             g_valid[i] = true;

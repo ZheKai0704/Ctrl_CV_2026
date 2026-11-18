@@ -317,6 +317,9 @@ static void encoderInit() {
 // ============================================================================
 static void onMoveCommand(const ChassisSnapshot &cmd);
 static void onMoveEstop();
+static void buildMoveTelemetry(uint8_t estopFlag, const float *targetRps,
+                               float rVx, float rVy, float rOmega);
+static void pushEstopTelemetry();
 
 // ============================================================================
 // SlaveApp 回呼 — SlaveComms 在 Core 1 呼叫
@@ -339,6 +342,7 @@ static volatile uint32_t dbg_cmdCount = 0; // Core 1 實際執行 onCommand 的�
 static volatile float dbg_measRps = 0.0f;  // FL(輪0) 量測轉速
 static volatile float dbg_outDuty0 = 0.0f; // FL(輪0) 實際輸出 duty%
 static uint8_t tmFrameSeq = 0;             // 遙測幀序號（Core 1 遞增）
+static MoveTelemetry pendingTm = {};       // Core 1 寫入 → Core 0 發送
 
 // 本 core 的 printf / Serial.printf 不支援 %f（會印成空白），
 // 因此序列監控一律用 ×100 整數輸出（vx/vy/omega/RPS = x0.01，
@@ -592,30 +596,73 @@ static void onMoveCommand(const ChassisSnapshot &cmd) {
     dbg_outDuty0 = wheels[0].outDuty;
 
     // ---- 遙測（四輪 current/target/輸出；由 Core 0 update() 定時送出）----
-    MoveTelemetry tm = {};
+    buildMoveTelemetry(0, targetRps, rVx, rVy, rOmega);
+    slave.prepareTelemetry(pendingTm);
+}
+
+// ---------------------------------------------------------------------------
+// 遙測組帧（Core 1 context；資料寫入 pendingTm，由呼叫端 prepareTelemetry）
+//   estopFlag：0 = 正常，1 = E-Stop 期間的保活遥測
+// ---------------------------------------------------------------------------
+static void buildMoveTelemetry(uint8_t estopFlag, const float *targetRps,
+                               float rVx, float rVy, float rOmega);
+
+static void buildMoveTelemetry(uint8_t estopFlag, const float *targetRps,
+                               float rVx, float rVy, float rOmega) {
+    pendingTm = {};
     for(int i = 0; i < 4; i++) {
-        tm.currentRps[i] = wheels[i].measRps;
-        tm.targetRps[i] = targetRps[i];
-        tm.pwmOutput[i] = wheels[i].appliedDuty;
+        pendingTm.currentRps[i] = wheels[i].measRps;
+        pendingTm.targetRps[i] = targetRps[i];
+        pendingTm.pwmOutput[i] = wheels[i].appliedDuty;
     }
-    tm.cmdVx = rVx;
-    tm.cmdVy = rVy;
-    tm.cmdOmega = rOmega;
-    tm.mode = static_cast<uint8_t>(RobotMode::AUTO);
-    tm.estopFlag = 0;
-    // ⚠ 遙測標頭（sync/msgType/frameSeq/targetID）、timestamp 與 CRC 由
+    pendingTm.cmdVx = rVx;
+    pendingTm.cmdVy = rVy;
+    pendingTm.cmdOmega = rOmega;
+    pendingTm.mode = static_cast<uint8_t>(RobotMode::AUTO);
+    pendingTm.estopFlag = estopFlag;
+    // ⚠ 遥測標頭（sync/msgType/frameSeq/targetID）、timestamp 與 CRC 由
     //   SignalUtils::finalizeTelemetry 統一填寫；手寫漏填 sync 或 CRC 會讓
     //   Hub 端驗證失敗而整包丟棄（序列監控只看到 "CRC mismatch"）。
     //   CRC 計算範圍不含 crc16 自身；timestamp 維持 us 計時的低 32 bits。
     SignalUtils::finalizeTelemetry(
-        tm, tmFrameSeq++, static_cast<uint32_t>(nowUs & 0xFFFFFFFFULL));
-    slave.prepareTelemetry(tm);
+        pendingTm, tmFrameSeq++,
+        static_cast<uint32_t>(time_us_64() & 0xFFFFFFFFULL));
+}
+
+// E-Stop 期間的遙測保活（Core 1）：讓 Hub 看到 estopFlag=1、知道 Move 還活著。
+// ⚠ 必須在 E-Stop 分支內呼叫：E-Stop 時 runCore1() 只跑 onEstop、不跑
+//   idleHook，而原本遥測只在 onMoveCommand 裡組 → 指令靜默 + E-Stop 期間
+//   遥測全斷 → Hub 500ms 就送 REBOOT → Move 無限重開機迴圈。
+constexpr uint32_t ESTOP_TM_INTERVAL_MS = 200;
+static void pushEstopTelemetry() {
+    static uint32_t lastMs = 0;
+    const uint32_t now = millis();
+    if(now - lastMs < ESTOP_TM_INTERVAL_MS) {
+        return;
+    }
+    lastMs = now;
+    static const float zeroRps[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    buildMoveTelemetry(1, zeroRps, 0.0f, 0.0f, 0.0f);
+    slave.prepareTelemetry(pendingTm);
 }
 
 // ============================================================================
 // onMoveEstop — 立即歸零所有 PWM，並清 PID 積分
 // ============================================================================
 static void onMoveEstop() {
+    // 本函式可能由兩邊呼叫：Core 0（SlaveComms::update() 的 100ms 指令逾時、
+    // 或收到 ESTOP 廣播）與 Core 1（runCore1() 的 E-Stop 分支，每圈都會呼）。
+    // Core 0 只做「最低延遲的硬體歸零」（PWM + DIR 暫存器寫入，非阻塞、
+    // 不碰 Core 1 的 PID 狀態），其餘一律交給 Core 1 的 E-Stop 分支處理。
+    // 這樣兩邊不會同時改寫 wheels[] 的非原子狀態（積分 / 量測等 float）。
+    if(get_core_num() == 0) {
+        for(int i = 0; i < 4; i++) {
+            wheelSetPwm(wheels[i].pwmPin, wheels[i].dirPin, 0.0f);
+        }
+        return;
+    }
+
+    // ---- 以下只在 Core 1 執行 ----
     // S 曲線也一併歸零：若停留在舊速度，E-Stop 解除後的第一個命令
     //   會直接以舊斜率／舊速度餵 PID → 瞬間大出力（暴衝）。
     rampVx.reset();
@@ -633,6 +680,10 @@ static void onMoveEstop() {
         wheels[i].encCount = enc[i]; // 解除後不計入停止期間的差分
         wheelSetPwm(wheels[i].pwmPin, wheels[i].dirPin, 0.0f);
     }
+
+    // E-Stop 期間的遙測保活（200ms 節流）：否則指令靜默 + E-Stop 時
+    // 遥測全斷，Hub 500ms 就送 REBOOT → Move 無限重開機。
+    pushEstopTelemetry();
 }
 
 // ============================================================================
