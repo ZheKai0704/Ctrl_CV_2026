@@ -1,8 +1,12 @@
 // ============================================================================
-// 超音波 — 獨立 US-100 感測器節點 (RP2040 / Pico)
+// 超音波 — 獨立 US-100 感測器節點 (RP2350)
 //
 // 透過 PIO 以 GPIO Trigger/Echo 模式讀取 8 顆 US-100 超音波感測器。
 // 將濾波後的距離數據與對位狀態透過 USB Serial 傳送至 Jetson。
+//
+// 時基：RP2350 預設 sysclk = 150 MHz。PIO SM 透過 clkdiv 強制降頻到
+//   固定 125 MHz（見 ultrasonic_echo.pio 的 init），故距離換算常數
+//   以 125 MHz 為準，不受 sysclk 影響。
 //
 // 硬體佈局（根據規格書）：
 //   前方：2 顆感測器 (frontL, frontR) — 面向正前方
@@ -47,56 +51,47 @@ static constexpr uint32_t ECHO_TIMEOUT_US = 30000U; // 30 ms ~ 最大距離約 5
 static constexpr uint32_t ECHO_MIN_WAIT_US = 400U;  // 感測器需約 300 us 啟動
 
 // ============================================================================
-// 距離校準偏移
-// 實測診斷：這顆 US-100 是 active-LOW 觸發，且距離有固定 +~35mm 偏移
-//   （量內部換能器膜片，非外殼前沿）。單顆測試用 45mm（使用者自訂）。
-//   正式版先沿用單顆測試校正值；若裝上車體後對位誤差明顯，再實測重新校正。
-// ============================================================================
-static constexpr int32_t DIST_OFFSET_MM =
-    45; // 感測器距離 - 實際距離 的固定偏移
-
-// ============================================================================
 // GPIO 腳位定義 — 8 顆 US-100 以 GPIO Trigger/Echo 模式運作
 //
 // 腳位編號：GPxx = Pico 板上的實體腳位
 // ============================================================================
 
 // --- 前方感測器（面向前方）---
-static constexpr uint8_t PIN_TRIG_FRONT_LEFT = 20; // GP2  = Pin 4   | Trigger
-static constexpr uint8_t PIN_ECHO_FRONT_LEFT = 21; // GP3  = Pin 5   | Echo
-static constexpr uint8_t PIN_TRIG_FRONT_RIGHT = 2; // GP4  = Pin 6   | Trigger
-static constexpr uint8_t PIN_ECHO_FRONT_RIGHT = 3; // GP5  = Pin 7   | Echo
+static constexpr uint8_t PIN_TRIG_FRONT_LEFT = 20;  // GP20 = Pin 26 | Trigger
+static constexpr uint8_t PIN_ECHO_FRONT_LEFT = 21;  // GP21 = Pin 27 | Echo
+static constexpr uint8_t PIN_TRIG_FRONT_RIGHT = 2;  // GP2  = Pin 4  | Trigger
+static constexpr uint8_t PIN_ECHO_FRONT_RIGHT = 3;  // GP3  = Pin 5  | Echo
 
 // --- 後方感測器（面向後方）---
-static constexpr uint8_t PIN_TRIG_BACK_LEFT = 12;  // GP6 = Pin 9  | Trigger
-static constexpr uint8_t PIN_ECHO_BACK_LEFT = 13;  // GP7 = Pin 10 | Echo
-static constexpr uint8_t PIN_TRIG_BACK_RIGHT = 14; // GP8 = Pin 11 | Trigger
-static constexpr uint8_t PIN_ECHO_BACK_RIGHT = 15; // GP9 = Pin 12 | Echo
+static constexpr uint8_t PIN_TRIG_BACK_LEFT = 12;   // GP12 = Pin 16 | Trigger
+static constexpr uint8_t PIN_ECHO_BACK_LEFT = 13;   // GP13 = Pin 17 | Echo
+static constexpr uint8_t PIN_TRIG_BACK_RIGHT = 14;  // GP14 = Pin 19 | Trigger
+static constexpr uint8_t PIN_ECHO_BACK_RIGHT = 15;  // GP15 = Pin 20 | Echo
 
 // --- 左側感測器（面向左方）---
-static constexpr uint8_t PIN_TRIG_LEFT_1 = 16;
-static constexpr uint8_t PIN_ECHO_LEFT_1 = 17; // GP11 = Pin 17  | Echo (front)
-static constexpr uint8_t PIN_TRIG_LEFT_2 = 18; // GP12 = Pin 18  | Trigger (rear)
-static constexpr uint8_t PIN_ECHO_LEFT_2 = 19; // GP13 = Pin 19  | Echo (rear)
+static constexpr uint8_t PIN_TRIG_LEFT_1 = 16;      // GP16 = Pin 21 | Trigger (front)
+static constexpr uint8_t PIN_ECHO_LEFT_1 = 17;      // GP17 = Pin 22 | Echo (front)
+static constexpr uint8_t PIN_TRIG_LEFT_2 = 18;      // GP18 = Pin 24 | Trigger (rear)
+static constexpr uint8_t PIN_ECHO_LEFT_2 = 19;      // GP19 = Pin 25 | Echo (rear)
 
 // --- 右側感測器（面向右方）---
-static constexpr uint8_t PIN_TRIG_RIGHT_1 = 6;  // GP14 = Pin 20  | Trigger (front)
-static constexpr uint8_t PIN_ECHO_RIGHT_1 = 7;  // GP15 = Pin 21  | Echo (front)
-static constexpr uint8_t PIN_TRIG_RIGHT_2 = 10; // GP16 = Pin 22  | Trigger (rear)
-static constexpr uint8_t PIN_ECHO_RIGHT_2 = 11; // GP17 = Pin 23  | Echo (rear)
+static constexpr uint8_t PIN_TRIG_RIGHT_1 = 6;      // GP6  = Pin 9  | Trigger (front)
+static constexpr uint8_t PIN_ECHO_RIGHT_1 = 7;      // GP7  = Pin 10 | Echo (front)
+static constexpr uint8_t PIN_TRIG_RIGHT_2 = 10;     // GP10 = Pin 12 | Trigger (rear)
+static constexpr uint8_t PIN_ECHO_RIGHT_2 = 11;     // GP11 = Pin 13 | Echo (rear)
 
 // ============================================================================
 // 感測器索引列舉與分組
 // ============================================================================
 enum SensorId : uint8_t {
     SENSOR_FRONT_LEFT = 0,  // Group A — PIO0 SM0
-    SENSOR_LEFT_1 = 1,      // Group A — PIO0 SM1
+    SENSOR_LEFT_1 = 1,      // Group B — PIO1 SM0（已與 L2 交換）
     SENSOR_RIGHT_1 = 2,     // Group A — PIO0 SM2
-    SENSOR_BACK_LEFT = 3,   // Group A — PIO1 SM2
+    SENSOR_BACK_LEFT = 3,   // Group B — PIO1 SM3（已與 BR 交換）
     SENSOR_FRONT_RIGHT = 4, // Group B — PIO0 SM3
-    SENSOR_LEFT_2 = 5,      // Group B — PIO1 SM0
+    SENSOR_LEFT_2 = 5,      // Group A — PIO0 SM1（已與 L1 交換）
     SENSOR_RIGHT_2 = 6,     // Group B — PIO1 SM1
-    SENSOR_BACK_RIGHT = 7,  // Group B — PIO1 SM3
+    SENSOR_BACK_RIGHT = 7,  // Group A — PIO1 SM2（已與 BL 交換）
     SENSOR_COUNT = 8
 };
 
@@ -118,20 +113,41 @@ struct SensorConfig {
 
 static const SensorConfig sensorConfigs[SENSOR_COUNT] = {
     // ---- Group A ----
+    // 注意：L1/L2 與 BL/BR 已交換（與實體安装對應），交換的是整個 config，
+    // 所以 PIO SM / 腳位跟著原感測器走，只是標籤對調，串音分組不變。
     {SENSOR_FRONT_LEFT, GROUP_A, pio0, 0, PIN_TRIG_FRONT_LEFT,
      PIN_ECHO_FRONT_LEFT, 0},
-    {SENSOR_LEFT_1, GROUP_A, pio0, 1, PIN_TRIG_LEFT_1, PIN_ECHO_LEFT_1, 0},
+    {SENSOR_LEFT_1, GROUP_B, pio1, 0, PIN_TRIG_LEFT_2, PIN_ECHO_LEFT_2, 0},
     {SENSOR_RIGHT_1, GROUP_A, pio0, 2, PIN_TRIG_RIGHT_1, PIN_ECHO_RIGHT_1, 0},
-    {SENSOR_BACK_LEFT, GROUP_A, pio1, 2, PIN_TRIG_BACK_LEFT,
-     PIN_ECHO_BACK_LEFT, 0},
+    {SENSOR_BACK_LEFT, GROUP_B, pio1, 3, PIN_TRIG_BACK_RIGHT,
+     PIN_ECHO_BACK_RIGHT, 0},
 
     // ---- Group B ----
     {SENSOR_FRONT_RIGHT, GROUP_B, pio0, 3, PIN_TRIG_FRONT_RIGHT,
      PIN_ECHO_FRONT_RIGHT, 0},
-    {SENSOR_LEFT_2, GROUP_B, pio1, 0, PIN_TRIG_LEFT_2, PIN_ECHO_LEFT_2, 0},
+    {SENSOR_LEFT_2, GROUP_A, pio0, 1, PIN_TRIG_LEFT_1, PIN_ECHO_LEFT_1, 0},
     {SENSOR_RIGHT_2, GROUP_B, pio1, 1, PIN_TRIG_RIGHT_2, PIN_ECHO_RIGHT_2, 0},
-    {SENSOR_BACK_RIGHT, GROUP_B, pio1, 3, PIN_TRIG_BACK_RIGHT,
-     PIN_ECHO_BACK_RIGHT, 0},
+    {SENSOR_BACK_RIGHT, GROUP_A, pio1, 2, PIN_TRIG_BACK_LEFT,
+     PIN_ECHO_BACK_LEFT, 0},
+};
+
+// ============================================================================
+// 距離校準偏移（每顆感測器獨立）
+//
+// 實測診斷：
+//   - 這批 US-100 是 active-LOW 觸發（閒置 HIGH、拉 LOW 觸發）。
+//   - 每顆感測器有各自的固定零點偏移（換能器膜片位置/批次差異），
+//     無法全車共用一個常數：實測 1640mm 讀 1622mm（前，-18mm）、
+//     實測 320mm 讀 270mm（後，-50mm）。
+//
+// offset 意義：raw 量測值 - offset = 修正後距離，即
+//   offset = 顯示值 - 實際值（在此修正前基準 offset=45mm）。
+//
+// 全車 8 顆統一使用固定偏移 45mm（依使用者指定）。
+// 若單顆實測對位誤差明顯，可個別調整陣列值。
+// ============================================================================
+static constexpr int32_t SENSOR_DIST_OFFSET_MM[SENSOR_COUNT] = {
+    45, 45, 45, 45, 45, 45, 45, 45
 };
 
 // ============================================================================
@@ -188,19 +204,29 @@ static uint g_pio1Offset = 0;
 // ============================================================================
 // 距離轉換
 //
-// PIO SM 以 F_SYS = 125 MHz（8 ns/週期）運作。
+// PIO SM 以固定 125 MHz（8 ns/週期）運作——PIO 的 clkdiv 會把
+// clk_sys（RP2350 預設 150 MHz）除頻到 125 MHz，因此換算常數
+// 不受 sysclk 影響。
 // 每次迴圈迭代 = 2 個 PIO 週期 = 16 ns。
 // 回音脈衝寬度 = count * 16 ns。
-// 距離 (mm) = 脈衝寬度 * 343,000 mm/s / 2
-//           = count * 2 * 16 * 1e-9 * 343,000 / 2
-//           = count * 343 / 125000
+// 距離 (mm) = 脈衝寬度 * 音速 / 2
+//           = count * 音速(m/s) / 125000
+//
+// 音速依室溫：v = 331.3 + 0.606 * T(°C)。
+// 實測診斷（2026）：以 343 m/s（20°C）換算時全車距離多讀約 3%
+//   （164cm 實距正確、68cm 讀 651）。最終由使用者指定 338 m/s
+//   （≈ 11°C 環境）作為校準值；若環境溫度改變，請更新此常數。
 // 30 ms 回音的最大計數：約 1,875,000 < 2^31，uint32 安全。
 // ============================================================================
-static uint32_t rawCountToMm(uint32_t count) {
-    // d_mm = count * 343 / 125000（先算原始距離 mm，再扣校準偏移）
+static constexpr int32_t SOUND_SPEED_M_S = 338; // 音速（m/s），實測校準
+static uint32_t rawCountToMm(uint32_t count, int sensorIdx) {
+    // d_mm = count * 音速 / 125000（先算原始距離 mm，再扣該顆感測器的校準偏移）
     const int32_t mm = static_cast<int32_t>(
-        (static_cast<uint64_t>(count) * 343ULL) / 125000ULL);
-    const int32_t corrected = mm - DIST_OFFSET_MM;
+        (static_cast<uint64_t>(count) *
+             static_cast<uint64_t>(SOUND_SPEED_M_S)) /
+        125000ULL);
+    const int32_t corrected =
+        mm - SENSOR_DIST_OFFSET_MM[sensorIdx];
     return (corrected > 0) ? static_cast<uint32_t>(corrected) : 0;
 }
 
@@ -210,6 +236,15 @@ static uint32_t rawCountToMm(uint32_t count) {
 static uint32_t g_rawCount[SENSOR_COUNT];
 static uint32_t g_distanceMm[SENSOR_COUNT];
 static bool g_valid[SENSOR_COUNT];
+// 本輪 PIO 原始量測是否成功（由 collectGroupResults 寫入，
+// 不直接寫 g_valid，讓 hold-last-good 邏輯統一在 doMeasurementCycle 判定）
+static bool g_cycleValid[SENSOR_COUNT];
+
+// 無效容忍（hold last good）：單次量測失敗不立刻標記無效，
+// 連續 CONSECUTIVE_FAIL_LIMIT 次失敗才認定感測器真正異常。
+// 期間 g_distanceMm[] 保持最後一次有效值，避免輸出瞬間變 "---"。
+static constexpr int CONSECUTIVE_FAIL_LIMIT = 3; // 約 3 個量測週期 ≈ 200ms
+static int g_failCount[SENSOR_COUNT];
 
 // ============================================================================
 // 分組觸發 — active-LOW 觸發。
@@ -270,10 +305,10 @@ static void collectGroupResults(SensorGroup group) {
 
                 if(val == 0) { // PIO 丟出 0 代表 PIO 自檢超時
                     g_rawCount[i] = 0;
-                    g_valid[i] = false;
+                    g_cycleValid[i] = false;
                 } else {
                     g_rawCount[i] = val;
-                    g_valid[i] = true;
+                    g_cycleValid[i] = true;
                 }
                 done[i] = true;
             }
@@ -292,7 +327,7 @@ static void collectGroupResults(SensorGroup group) {
     for(int i = 0; i < SENSOR_COUNT; i++) {
         if(!done[i] && sensorConfigs[i].group == group) {
             g_rawCount[i] = 0;
-            g_valid[i] = false;
+            g_cycleValid[i] = false;
 
             // 【重要】不要隨便呼叫 pio_sm_restart，清空 FIFO 緩衝區即可
             pio_sm_clear_fifos(sensorConfigs[i].pio, sensorConfigs[i].sm);
@@ -304,6 +339,10 @@ static void collectGroupResults(SensorGroup group) {
 // 全部 6 顆感測器的一個完整量測週期
 // ============================================================================
 static void doMeasurementCycle() {
+    // 本輪原始有效性旗標預設為失敗，由 collect 更新
+    for(int i = 0; i < SENSOR_COUNT; i++)
+        g_cycleValid[i] = false;
+
     // ---- Phase 1: Group A ----
     rearmGroupSMs(GROUP_A); // 1. 釋放 PIO 的 pull 阻塞，讓 PIO 開始準備監聽
     fireGroupTrigger(
@@ -315,11 +354,22 @@ static void doMeasurementCycle() {
     fireGroupTrigger(GROUP_B);
     collectGroupResults(GROUP_B);
 
-    // 更新中位數濾波器
+    // 更新中位數濾波器 + 無效容忍邏輯
     for(int i = 0; i < SENSOR_COUNT; i++) {
-        if(g_valid[i] && g_rawCount[i] > 0) {
+        if(g_cycleValid[i] && g_rawCount[i] > 0) {
+            // 本輪成功：重置失敗計數，標記有效，插入濾波器並更新距離
+            g_failCount[i] = 0;
+            g_valid[i] = true;
             medianInsert(i, g_rawCount[i]);
-            g_distanceMm[i] = rawCountToMm(medianGet(i));
+            g_distanceMm[i] = rawCountToMm(medianGet(i), i);
+        } else {
+            // 本輪失敗：若尚未超過容忍上限，保持 g_valid=true 與最後有效距離
+            if(g_valid[i] && g_failCount[i] < CONSECUTIVE_FAIL_LIMIT) {
+                g_failCount[i]++;
+            } else {
+                // 連續失敗次數超限（或本來就沒有有效資料）→ 標記無效
+                g_valid[i] = false;
+            }
         }
     }
 }
@@ -488,9 +538,9 @@ void setup() {
     }
 
     // 3. 載入 PIO 程式
-    //    PIO0：SM0=FL, SM1=L1, SM2=R1, SM3=FR
-    //    PIO1：SM0=L2, SM1=R2, SM2=BL, SM3=BR
-    //    （8 顆 → PIO0/PIO1 共 8 個 SM 全數用完）
+    //    PIO0：SM0=FL, SM1=L2, SM2=R1, SM3=FR
+    //    PIO1：SM0=L1, SM1=R2, SM2=BR, SM3=BL
+    //    （L1/L2、BL/BR 已交換；8 顆 → PIO0/PIO1 共 8 個 SM 全數用完）
     g_pio0Offset = pio_add_program(pio0, &ultrasonic_echo_program);
     pio_sm_claim(pio0, 0);
     pio_sm_claim(pio0, 1);

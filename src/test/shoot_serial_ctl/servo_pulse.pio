@@ -1,0 +1,33 @@
+; ============================================================================
+; servo_pulse.pio — 50Hz servo / ESC 脈衝產生器（一個 SM 一個通道）
+;
+; clkdiv 設成 clk_sys/1MHz → 1 個 PIO 週期 = 1µs（150MHz 時 divider = 150.0）
+;
+; CPU 每個 20ms 幀 push 兩個值（TX FIFO 深度 4 → 可預塞 2 幀緩衝）：
+;   1) 高電位週期數 h  → 脈衝寬度 = h + 3 µs（set + pull + mov 的額外週期）
+;   2) 低電位週期數 l  → 一個完整框 = h + l + 6 µs = 20000µs（50Hz）
+;
+; FIFO 沒資料時 SM 停在 pull block，輸出保持低電位（ESC 會走 failsafe → 安全）。
+;
+; 週期數：
+;   set pins,1      1 cycle
+;   jmp x-- 迴圈    x cycles（每次迭代 1 週期）
+;   pull + mov      2 cycles
+;   set pins,0      1 cycle
+;   jmp x-- 迴圈    y cycles
+;   pull + mov      2 cycles
+;   → 高電位 = x + 3、整框 = x + y + 6
+; ============================================================================
+.program servo_pulse
+.wrap_target
+    pull block              ; 取高電位週期數
+    mov x, osr
+    set pins, 1             ; 脈衝上升
+high:
+    jmp x-- high            ; 1 cycle/µs
+    pull block              ; 取低電位週期數
+    mov x, osr
+    set pins, 0             ; 脈衝下降
+low:
+    jmp x-- low             ; 1 cycle/µs，補滿 20ms 框
+.wrap

@@ -54,7 +54,7 @@
 //     STEP=GP17（PIO0 SM 產生脈衝）、DIR=GP16、EN=GP18（低電位致能）
 //     行程限制：以 0 步為中間，前 / 後各最多 2400 步（RowStepper::STEP_LIMIT_*）
 //   無刷電調（ESC）：GP13 硬體 PWM 50Hz，1000µs = 0%、2000µs = 100%
-//     本版固定 0%（不轉），見 EscOutput::SPEED_PCT
+//     上電先送 0% 完成 arming（ARM_DELAY_MS），再爬升到 EscOutput::SPEED_PCT
 //   ※ 本節點已移除 trigger 步進馬達（GP6 未使用；GP4/GP5 現在是 I2C SDA/SCL）
 // ============================================================================
 #include "SlaveComms.h"
@@ -97,14 +97,28 @@ static SlaveLog storageLog;
 // ============================================================================
 // ESC（單向油門）：硬體 PWM 持續送 50Hz 訊號
 //   1000µs = 0%（停轉）、2000µs = 100%
-//   本版 Storage 的 ESC 固定 0%，上電就維持停轉。
+//
+// Arming 程序（解決 Pico 與 ESC 開機時間不同步 → ESC 拒轉的問題）：
+//   ESC 上電時必須先收到中性訊號（1000µs）一段時間才會完成 arm / 節流校正，
+//   之後才接受油門。若上電瞬間直接收到非 0% 的油門，ESC 會判定訊號無效而
+//   拒絕旋轉。因此流程固定為：
+//     1. init()  → 先送 0%（1000µs），不論目標轉速是多少
+//     2. update()（由 Core 0 loop() 每圈呼叫）→ 送滿 ARM_DELAY_MS 的 0%
+//     3. 送滿後在 RAMP_MS 內由 0% 線性爬升到 setPercent() 指定的目標
+//   這樣就算 ESC 比 Pico 晚通電，也一定先看到足夠久的中性訊號才收到油門。
 // ============================================================================
 namespace EscOutput {
 constexpr uint32_t TICK_HZ = 1000000; // 1 tick = 1µs
 constexpr uint16_t PWM_WRAP = 19999;  // 20000 ticks = 20ms → 50Hz
 constexpr uint16_t PULSE_ZERO_US = 1000;
 constexpr uint16_t PULSE_FULL_US = 2000;
-constexpr uint8_t SPEED_PCT = 30; // 目前固定速度 0%
+constexpr uint8_t SPEED_PCT = 30; // 目標固定速度（先 0% → arming 後爬升到此）
+
+// Arming 時間：上電後維持 0% 這麼久，ESC 才算完成 arm
+// （一般 BLHeli / HobbyWing 電調約需 1~3 秒的中性訊號；抓寬一點保險）
+constexpr uint32_t ARM_DELAY_MS = 3000;
+// 0% → 目標轉速的線性爬升時間（太陡 ESC 也可能當成異常訊號）
+constexpr uint32_t RAMP_MS = 2000;
 
 static uint16_t pulseUsFor(uint8_t percent) {
     if(percent > 100) {
@@ -125,6 +139,13 @@ static void writePulse(uint16_t us) {
     pwm_set_gpio_level(Pin::ESC_PWM, us); // level = 高電位 tick 數 = µs
 }
 
+// 目前輸出的實際百分比（爬升過程中的瞬間值）
+static uint8_t sCurrentPct = 0;
+// 目標百分比（arming 完成後要爬到的值）
+static uint8_t sTargetPct = 0;
+// init() 的時間戳，用來計算 arming 是否已送滿
+static uint32_t sInitMs = 0;
+
 void init(uint8_t percent) {
     gpio_set_function(Pin::ESC_PWM, GPIO_FUNC_PWM);
     const float div = static_cast<float>(clock_get_hz(clk_sys)) /
@@ -134,10 +155,42 @@ void init(uint8_t percent) {
     pwm_config_set_wrap(&cfg, PWM_WRAP);
     const uint slice = pwm_gpio_to_slice_num(Pin::ESC_PWM);
     pwm_init(slice, &cfg, true);
-    writePulse(pulseUsFor(percent));
+    // 一律先送 0%（中性訊號），不論目標轉速；等 arming 完成再由 update() 爬升
+    sTargetPct = percent;
+    sCurrentPct = 0;
+    sInitMs = millis();
+    writePulse(pulseUsFor(0));
 }
 
-void setPercent(uint8_t percent) { writePulse(pulseUsFor(percent)); }
+/// Core 0 loop() 每圈呼叫：arming 等待 + 0% → 目標轉速的線性爬升
+void update(uint32_t nowMs) {
+    if(sCurrentPct >= sTargetPct) {
+        if(sCurrentPct != sTargetPct) {
+            sCurrentPct = sTargetPct;
+            writePulse(pulseUsFor(sCurrentPct));
+        }
+        return;
+    }
+    if(nowMs < sInitMs + ARM_DELAY_MS)
+        return; // 還在送 0% 等 ESC arm
+    const uint32_t sinceArm = nowMs - (sInitMs + ARM_DELAY_MS);
+    if(sinceArm >= RAMP_MS) {
+        sCurrentPct = sTargetPct;
+    } else {
+        sCurrentPct = static_cast<uint8_t>(
+            (static_cast<uint32_t>(sTargetPct) * sinceArm) / RAMP_MS);
+    }
+    writePulse(pulseUsFor(sCurrentPct));
+}
+
+uint8_t currentPercent() { return sCurrentPct; }
+
+/// 直接下目標轉速：不跳變，交給 update() 線性爬升（若已在爬升中則更新終點）
+void setPercent(uint8_t percent) {
+    if(percent > 100)
+        percent = 100;
+    sTargetPct = percent;
+}
 } // namespace EscOutput
 
 // PCA9685 暫存器 / 時序常數集中在 lib/Pca9685（Pca9685Reg），
@@ -182,7 +235,7 @@ struct ServoProfile {
 constexpr ServoProfile PROFILE[Pca9685Reg::CHANNEL_COUNT] = {
     /* CH0  */ {30.0f, 110.0f, false},
     /* CH1  */ {30.0f, 100.0f, false},
-    /* CH2  */ {30.0f, 110.0f, false},
+    /* CH2  */ {25.0f, 110.0f, false},
     /* CH3  */ {30.0f, 110.0f, false},
     /* CH4  */ {30.0f, 110.0f, false},
     /* CH5  */ {30.0f, 110.0f, false},
@@ -190,11 +243,11 @@ constexpr ServoProfile PROFILE[Pca9685Reg::CHANNEL_COUNT] = {
     /* CH7  */ {30.0f, 110.0f, false},
     /* CH8  */ {30.0f, 110.0f, false},
     /* CH9  */ {30.0f, 110.0f, false},
-    /* CH10 */ {30.0f, 110.0f, false},
-    /* CH11 */ {30.0f, 110.0f, false},
+    /* CH10 */ {25.0f, 110.0f, false},
+    /* CH11 */ {20.0f, 110.0f, false},
     /* CH12 */ {30.0f, 110.0f, false},
     /* CH13 */ {30.0f, 120.0f, false},
-    /* CH14 */ {30.0f, 110.0f, false},
+    /* CH14 */ {15.0f, 110.0f, false},
     /* CH15 */ {30.0f, 110.0f, false},
 };
 
@@ -1140,6 +1193,7 @@ static void refreshTelemetry(); // 定義於下方
 
 static void onStorageEstop() {
     MotorControl::estop();
+    EscOutput::setPercent(0); // E-Stop → ESC 停轉
     // 步進：只由 Core 1 操作 PIO（避免與 idleHook 同時改 PIO 暫存器）
     if(get_core_num() == 1) {
         RowStepper::estop();
@@ -1156,6 +1210,8 @@ static void buildTelemetry(); // 定義於下方
 
 static void onStorageCommand(const ChassisSnapshot &cmd) {
     MotorControl::executeMotion(cmd);
+    // 無刷 ESC（GP13）：sw=1 → 轉（爬升到 SPEED_PCT），sw=0 → 停（0%）
+    EscOutput::setPercent(cmd.sw ? EscOutput::SPEED_PCT : 0);
     RowStepper::setTarget(cmd.row); // 水平：STEP/DIR 脈衝
     // 只在 row 數值變動時記一行（控制幀約 100Hz，不能每幀印）
     static int16_t sLastRow = 1000;
@@ -1275,7 +1331,7 @@ static void updateStatusLed() {
 // Core 0
 // ============================================================================
 void setup() {
-    EscOutput::init(EscOutput::SPEED_PCT); // ESC GP13 先維持 0%（停轉）
+    EscOutput::init(0); // ESC GP13 先維持 0%（停轉），等 Hub sw=1 才爬升轉速
     RowStepper::init();                    // 水平 STEP/DIR/EN（PIO0 SM）
     statusLed.begin();
     digitalWrite(LED_BUILTIN, HIGH); // 開機先亮（BOOT 狀態）
@@ -1283,10 +1339,11 @@ void setup() {
     Serial.begin(115200);
     delay(200);
     Serial.println("[STORAGE] boot");
-    Serial.printf("[ESC] GP%u 50Hz 輸出 %u%% (%uus)\n",
+    Serial.printf("[ESC] GP%u 50Hz arming %lums（先送 0%%），之後 %lums 內爬升到 %u%%\n",
                   static_cast<unsigned>(Pin::ESC_PWM),
-                  static_cast<unsigned>(EscOutput::SPEED_PCT),
-                  static_cast<unsigned>(EscOutput::pulseUsFor(EscOutput::SPEED_PCT)));
+                  static_cast<unsigned long>(EscOutput::ARM_DELAY_MS),
+                  static_cast<unsigned long>(EscOutput::RAMP_MS),
+                  static_cast<unsigned>(EscOutput::SPEED_PCT));
 
     slave.begin(); // 硬體 UART0 (GP0/GP1) → Hub
     slave.setIdleHook(storageIdleHook);
@@ -1296,6 +1353,7 @@ void loop() {
     slave.update();
     updateStatusLed();
     storageLog.drain(Serial);
+    EscOutput::update(millis()); // ESC arming 等待 + 0% → 目標轉速爬升
 
     // PCA9685 初始化結果（Core 1 完成後印一次）
     static bool pcaPrinted = false;
@@ -1320,7 +1378,7 @@ void loop() {
                       static_cast<long>(RowStepper::refStepsValue()),
                       static_cast<long>(RowStepper::targetStepsValue()),
                       RowStepper::isMoving() ? "移動中" : "停止",
-                      static_cast<unsigned>(EscOutput::SPEED_PCT),
+                      static_cast<unsigned>(EscOutput::currentPercent()),
                       static_cast<unsigned long>(slave.validCmdCount()));
     }
 }

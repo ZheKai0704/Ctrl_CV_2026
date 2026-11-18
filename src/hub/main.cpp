@@ -25,12 +25,12 @@
 // 控制邏輯（Jetson 主控、遙控器只當備援/手動介入）
 //    - JETSON 模式：Jetson 持有「全部」控制權
 //        * Move / Shoot / Storage 所有命令、所有通道值都只來自 Jetson
-//        * 遙控器只准讀 rc[5]（控制來源切換開關），其他 rc 通道一律不理
+//        * 遙控器只准讀 rc[4]（控制來源切換開關），其他 rc 通道一律不理
 //        * 即使 RC Failsafe 也不會因此送 E-Stop（不干擾 Jetson）
-//    - RC_SWITCH：rc[5] < -10 → 遙控器接管全部 Slave（Jetson 命令丟棄）
+//    - RC_SWITCH：rc[4] < -10 → 遙控器接管全部 Slave（Jetson 命令丟棄）
 //    - RC_FALLBACK：Jetson 逾時 (>500ms) → 自動改用遙控數據備援
 //    - 遙控也斷線 (Failsafe) 且 Jetson 也逾時 → 發送 E-Stop 廣播至所有 slaves
-//    - 遙控 Failsafe 時不看 rc[5]（讀不到），自動退回 Jetson，不會鎖死
+//    - 遙控 Failsafe 時不看 rc[4]（讀不到），自動退回 Jetson，不會鎖死
 //
 // 控制來源每圈 loop() 只評估一次（ControlSource），onJetsonFrame() 與 RC
 // 轉發都只看同一個值 → 不會出現「兩邊同時送命令」的競態。
@@ -62,7 +62,7 @@
 // 跨核心共用變數 — Core 1 寫入，Core 0 讀取
 // RP2350 SCU 保證 cache coherency，volatile 防止編譯器過度優化
 // ============================================================================
-static volatile int16_t rc_channels[10]; // -100 ~ 100，由 Core 1 更新
+static volatile int16_t rc_channels[16]; // -100 ~ 100，由 Core 1 更新
 static volatile bool rc_failsafe;        // true = 遙控器斷線
 
 // ============================================================================
@@ -351,9 +351,9 @@ static uint64_t lastRcForwardUs = 0;    // RC 備援最後轉發時間
 //
 //   JETSON      — Jetson 持有「全部」控制權：
 //                 Move / Shoot / Storage 的所有命令、所有通道值都只來自 Jetson。
-//                 遙控器只准讀 rc[5]（切換開關），其他 rc[0..4]、rc[6..9]
+//                 遙控器只准讀 rc[4]（切換開關），其他 rc[0..3]、rc[5..9]
 //                 一律不參與，連 RC Failsafe 也不會送 E-Stop。
-//   RC_SWITCH   — rc[5] 切到遙控邊（< -10）：遙控器接管全部 Slave，
+//   RC_SWITCH   — rc[4] 切到遙控邊（< -10）：遙控器接管全部 Slave，
 //                 Jetson 命令全部丟棄（仍保留心跳/時間戳）。
 //   RC_FALLBACK — Jetson 逾時 >500ms：自動備援，遙控器接管。
 //
@@ -420,7 +420,7 @@ static LedState currentLedState() {
     // Jetson 沒資料、遥控也斷線 → E-Stop，長亮
     if(!jetsonActive && rc_failsafe)
         return LedState::ESTOP;
-    // 有控制流：Jetson 在送幀，或遙控正接管（rc[5] 切換 / Jetson 逾時備援）
+    // 有控制流：Jetson 在送幀，或遙控正接管（rc[4] 切換 / Jetson 逾時備援）
     if(jetsonActive || gSource != ControlSource::JETSON)
         return LedState::ACTIVE;
     // 曾連上 Jetson，目前沒控制流（遥控在線但沒接管）→ 慢閃
@@ -456,19 +456,9 @@ static void forwardAllSlaves(const ControlPacket &pkt) {
 //     （方向實測：前後正常；左右與 cw/ccw 需反相 VX_SIGN/OMEGA_SIGN = -1）
 //
 //   控制來源：
-//     rc[5] → 控制來源切換：< -10 → 遙控接管全部 Slave
-//                            其餘 → JETSON 模式（遙控器只讀這個開關，
-//                                    rc[0..4]、rc[6..9] 完全不參與）
-//
-//   Shoot:
-//     rc[2] → pitch          上下仰角
-//     rc[3] → row            左右水平
-//     rc[4] → 投射輪啟停：< 0 → 開，≥ 0 → 0（停轉）
+//     rc[7] → 底盤旋轉 omega（< 0 cw / > 0 ccw，遙控備援時用）
+//     rc[6] → 上下射轉速微調（< -10 → +5%，> +10 → -5%）
 //              開的時候轉速固定 50%（不隨通道值變動）
-//     rc[6] → 上下射轉速微調（上下兩顆同時套用）：
-//               < -10 → 每觸發一次 +5%
-//               > +10 → 每觸發一次 -5%
-//               範圍 0~100%，0% = 1500µs 停轉
 //
 //   Storage:
 //     rc[8] → trigger        0/1（< 0 視為 1）
@@ -503,18 +493,21 @@ static int8_t rcToInt8(int16_t rcVal) {
 //   VX              = rc[0] → 左右平移
 //   VY              = rc[1] → 前後
 //   OMEGA           = rc[6] → cw/ccw 旋轉
-//   STORAGE_TRIGGER = rc[8] → < 0 觸發機構
+//   STORAGE_TRIGGER = rc[7] → < 0 觸發機構
 //         若你的旋轉改插別的通道，把 OMEGA 換成對應的 0-based 索引即可。
+// （2026 全改版）對應表：
+//   rc[4] = 馬達總開關   rc[5] = 來源切換   rc[6] = 射轉速微調
+//   rc[7] = 底盤 omega   rc[8] = trigger    rc[9] = 未使用
 namespace RcMap {
 constexpr uint8_t VX = 0;    // rc[0]
 constexpr uint8_t VY = 1;    // rc[1]
-constexpr uint8_t OMEGA = 6; // rc[6]
-// Shoot 投射輪啟停：< 0 → 開（轉速固定 50%），≥ 0 → 0%（停轉）
+// 馬達總開關：< 0 → 開（Move 四輪 + Shoot 投射輪），≥ 0 → 全部停
 constexpr uint8_t SHOOT_ENABLE = 4; // rc[4]
 // 控制來源切換：< -10 → 遙控優先（強制走 RC），其餘 → Jetson 優先
 constexpr uint8_t SOURCE_SELECT = 5; // rc[5]
 // 上下射轉速微調：< -10 → +5%，> +10 → -5%（上下兩顆同時）
 constexpr uint8_t SHOOT_SPEED = 6; // rc[6]
+constexpr uint8_t OMEGA = 7; // rc[7] → 底盤 cw/ccw 旋轉
 // Storage 機構觸發：< 0 就開始「全部通道跑一次」（Storage 端做上緣觸發）
 constexpr uint8_t STORAGE_TRIGGER = 8; // rc[8]
 // 方向修正（實機實測）：前後正常，左右與 cw/ccw 相反 → 這兩個反相。
@@ -565,8 +558,7 @@ static ControlPacket rcToMovePacket() {
     pkt.targetID = TargetID::MOVE;
     pkt.payloadLen = sizeof(ControlPacket) - 6 - 2;
 
-    // ⚠ 舊版把 vx/vy 對調（推前進變橫移）。omega 依 rc[6]
-    //    （cw/ccw 旋轉），可用上面 RcMap::OMEGA 一行改通道。
+    // rc[4] 只管無刷馬達（Shoot 上下兩顆 + Storage ESC），不管四輪
     pkt.move.vx = rcAxisToWire(rc_channels[RcMap::VX],
                                RcMoveCfg::FULL_TRANSLATE_RPS,
                                RcMap::VX_SIGN);
@@ -671,11 +663,7 @@ static void updateRcShootSpeed() {
     if(sShootTrim > RcShootCfg::TRIM_MAX)
         sShootTrim = RcShootCfg::TRIM_MAX;
 
-    Serial.printf("[HUB] 上下射轉速 → %d%%（微調 %d%%，rc[%u]=%d）\r\n",
-                  static_cast<int>(rcShootSpeedPct()),
-                  static_cast<int>(sShootTrim),
-                  static_cast<unsigned>(RcMap::SHOOT_SPEED),
-                  static_cast<int>(rc));
+    (void)rc;
 }
 
 static ControlPacket rcToShootPacket() {
@@ -709,9 +697,9 @@ static ControlPacket rcToShootPacket() {
 // ============================================================================
 // RC → Storage ControlPacket
 //
-//   rc[8] < 0 → trigger=1，Storage 在「上緣」觸發
+//   rc[7] < 0 → trigger=1，Storage 在「上緣」觸發
 //                 全部已啟用伺服通道跑一次循環
-//   rc[8] ≥ 0 → trigger=0（Storage 停止並全部回 HOME）
+//   rc[7] ≥ 0 → trigger=0（Storage 停止並全部回 HOME）
 //
 // motorChannel / sw 本版 Storage 不使用，固定填 0。
 // ============================================================================
@@ -726,7 +714,8 @@ static ControlPacket rcToStoragePacket() {
     pkt.payloadLen = sizeof(ControlPacket) - 6 - 2;
 
     pkt.storage.motorChannel = 0; // 本版不使用
-    pkt.storage.sw = 0;           // 本版不使用
+    // rc[4] 馬達總開關：< 0 → 開（Storage ESC 轉），≥ 0 → 停
+    pkt.storage.sw = (rc_channels[RcMap::SHOOT_ENABLE] < 0) ? 1 : 0;
     pkt.storage.trigger = (rc_channels[RcMap::STORAGE_TRIGGER] < 0) ? 1 : 0;
     pkt.storage.row = rcToInt8(rc_channels[3]);
 
@@ -764,12 +753,12 @@ static ControlSource evaluateControlSource(uint64_t nowUs) {
 static const char *controlSourceName(ControlSource s) {
     switch(s) {
     case ControlSource::RC_SWITCH:
-        return "RC(ch5-switch)";
+        return "RC-switch  ";
     case ControlSource::RC_FALLBACK:
-        return "RC(jetson-timeout)";
+        return "RC-timeout ";
     case ControlSource::JETSON:
     default:
-        return "JETSON";
+        return "JETSON    ";
     }
 }
 
@@ -777,9 +766,9 @@ static const char *controlSourceName(ControlSource s) {
 // （Shoot 轉速微調量 sShootTrim 刻意保留：下次切回遙控時接續上次的值）
 static void onControlSourceChanged(ControlSource from, ControlSource to) {
     resetRcShootStepState();
-    Serial.printf("[HUB] 控制來源 %s → %s（Jetson 模式下遙控器只讀 rc[%u] 開關）\n",
-                  controlSourceName(from), controlSourceName(to),
-                  static_cast<unsigned>(RcMap::SOURCE_SELECT));
+    (void)from;
+    (void)to;
+    // 序列輸出已簡化：不印切換訊息，狀態只顯示在主行 src 欄位
 }
 
 // ============================================================================
@@ -881,7 +870,7 @@ static void tryRcFallback() {
     }
 
     // 遙控正常 → 轉發控制幀給 Storage（PIO SM2, GP6 TX / GP7 RX）
-    // rc[8] < 0 → trigger=1，
+    // rc[7] < 0 → trigger=1，
     // Storage 端以上緣觸發「全部通道跑一次」
     if(RC_FORWARD_STORAGE) {
         ControlPacket st = rcToStoragePacket();
@@ -1004,35 +993,22 @@ void loop() {
 
     // ---- 序列輸出：每 500ms 只印一行 RC 通道數據 ----
     static uint64_t lastDbgUs = 0;
-    if(now - lastDbgUs > 500000ULL) {
+    if(now - lastDbgUs > 50000ULL) {
         lastDbgUs = now;
-        int16_t rcSnapshot[10];
+        int16_t rcSnapshot[16];
         // 讀取 Core 1 的 RC 資料
-        for(int i = 0; i < 10; i++)
+        for(int i = 0; i < 16; i++)
             rcSnapshot[i] = rc_channels[i];
-        Serial.printf("[HUB] rc[0..9]: %4d %4d %4d %4d %4d %4d %4d %4d %4d "
-                      "%4d%s%s\n",
+        Serial.printf("[HUB] %s | rc: "
+                      "%4d %4d %4d %4d %4d %4d %4d %4d "
+                      "%4d %4d %4d %4d %4d %4d %4d %4d\n",
+                      controlSourceName(gSource),
                       rcSnapshot[0], rcSnapshot[1], rcSnapshot[2],
                       rcSnapshot[3], rcSnapshot[4], rcSnapshot[5],
-                      rcSnapshot[6], rcSnapshot[7], rcSnapshot[8],
-                      rcSnapshot[9],
-                      (gSource == ControlSource::JETSON) ? "" : "  [RC 接管]",
-                      rc_failsafe ? "  (FAILSAFE)" : "");
-        Serial.printf("[HUB] src=%s | shoot: enable(rc[4])=%d speed(rc[6])=%d%% "
-                      "| jetsonFrames=%lu dropped=%lu\n",
-                      controlSourceName(gSource),
-                      static_cast<int>(rcSnapshot[RcMap::SHOOT_ENABLE]),
-                      static_cast<int>(rcShootSpeedPct()),
-                      static_cast<unsigned long>(jetsonFrameCount),
-                      static_cast<unsigned long>(jetsonDroppedCount));
-        if(lastStorageTmUs != 0) {
-            Serial.printf("[HUB] storage row: cmd=%d target=%ld pos=%ld "
-                          "moving=%d\n",
-                          rcSnapshot[3],
-                          static_cast<long>(latestStorageTm.cmdVx),
-                          static_cast<long>(latestStorageTm.cmdVy),
-                          latestStorageTm.cmdOmega > 0.5f ? 1 : 0);
-        }
+                      rcSnapshot[6], rcSnapshot[7],
+                      rcSnapshot[8], rcSnapshot[9], rcSnapshot[10],
+                      rcSnapshot[11], rcSnapshot[12], rcSnapshot[13],
+                      rcSnapshot[14], rcSnapshot[15]);
     }
 
     delayMicroseconds(20);
@@ -1059,9 +1035,9 @@ void loop1() {
 
         // 逐元素寫入全域變數 (避免 volatile pointer 傳入 memcpy 的編譯錯誤)
         // RP2350 SCU 保證 cache coherency，Core 0 讀取時可見最新值
-        int16_t rcSnapshot[10];
+        int16_t rcSnapshot[16];
         crsf.getChannels(rcSnapshot);
-        for(int i = 0; i < 10; i++) {
+        for(int i = 0; i < 16; i++) {
             rc_channels[i] = rcSnapshot[i];
         }
         rc_failsafe = crsf.isFailsafe();

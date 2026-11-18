@@ -219,7 +219,7 @@ void CrsfReceiver::update() {
         uint16_t raw_channels[16];
         decodeRcChannels(_frameBuf + 3, raw_channels);
 
-        for(uint8_t idx = 0; idx < 10; idx++) {
+        for(uint8_t idx = 0; idx < 16; idx++) {
             _finalChannels[idx] = normalizeChannel(raw_channels[idx], idx);
         }
         if(_ledEnabled)
@@ -229,7 +229,7 @@ void CrsfReceiver::update() {
     // 檢查超時
     if(currentTime - _lastValidFrameTime > FAILSAFE_TIMEOUT_MS) {
         _isFailsafeActive = true;
-        for(int idx = 0; idx < 10; idx++)
+        for(int idx = 0; idx < 16; idx++)
             _finalChannels[idx] = 0;
         _finalChannels[4] = 0; // rc[4]：Failsafe 保護 → < 0 是「投射輪開」，所以強制歸 0（停轉）
 
@@ -240,6 +240,6 @@ void CrsfReceiver::update() {
     }
 }
 
-void CrsfReceiver::getChannels(int16_t output[10]) {
+void CrsfReceiver::getChannels(int16_t output[16]) {
     memcpy(output, _finalChannels, sizeof(_finalChannels));
 }
